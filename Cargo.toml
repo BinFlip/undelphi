@@ -1,0 +1,19 @@
+[package]
+name = "undelphi"
+version = "0.1.0"
+edition = "2024"
+authors = ["Johann Kempter <admin@binflip.rs>"]
+rust-version = "1.85"
+description = "Static analysis library for Delphi / C++Builder / Free Pascal compiled binaries — identification and metadata extraction (RTTI, VMTs, DFM forms, packages)"
+license = "Apache-2.0"
+repository = "https://github.com/BinFlip/delphi"
+readme = "README.md"
+keywords = ["delphi", "pascal", "parser", "reverse-engineering", "binary-analysis"]
+categories = ["parser-implementations"]
+exclude = ["tests/samples/", "reference/", "research/"]
+
+[dependencies]
+goblin = "0.10.5"
+scroll = "0.13.0"
+
+[dev-dependencies]
