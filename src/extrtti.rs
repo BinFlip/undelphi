@@ -147,28 +147,33 @@ pub fn decode_attribute_block<'a>(
 ) -> (Vec<AttributeEntry<'a>>, usize) {
     let mut cursor = 0usize;
     let mut out = Vec::new();
-    loop {
-        let Some(attr_type_ref) = read_ptr(bytes, cursor, ptr_size) else {
-            break;
-        };
-        let Some(attr_ctor) = read_ptr(bytes, cursor + ptr_size, ptr_size) else {
-            break;
-        };
-        let Some(arg_len) = read_u16(bytes, cursor + 2 * ptr_size).map(usize::from) else {
-            break;
-        };
-        let arg_start = cursor + 2 * ptr_size + 2;
-        let Some(arg_data) = bytes.get(arg_start..arg_start + arg_len) else {
-            break;
-        };
-        out.push(AttributeEntry {
+    while let Some((entry, advance)) = decode_one_attribute(bytes, cursor, ptr_size) {
+        out.push(entry);
+        cursor = advance;
+    }
+    (out, cursor)
+}
+
+/// Decode a single attribute entry at `cursor`. Returns the entry and the
+/// cursor position one byte past it, or `None` when any read overruns.
+fn decode_one_attribute<'a>(
+    bytes: &'a [u8],
+    cursor: usize,
+    ptr_size: usize,
+) -> Option<(AttributeEntry<'a>, usize)> {
+    let attr_type_ref = read_ptr(bytes, cursor, ptr_size)?;
+    let attr_ctor = read_ptr(bytes, cursor + ptr_size, ptr_size)?;
+    let arg_len = read_u16(bytes, cursor + 2 * ptr_size).map(usize::from)?;
+    let arg_start = cursor + 2 * ptr_size + 2;
+    let arg_data = bytes.get(arg_start..arg_start + arg_len)?;
+    Some((
+        AttributeEntry {
             attr_type_ref,
             attr_ctor,
             arg_data,
-        });
-        cursor = arg_start + arg_len;
-    }
-    (out, cursor)
+        },
+        arg_start + arg_len,
+    ))
 }
 
 /// Walk the extended-RTTI property block for `class`. Returns an empty
