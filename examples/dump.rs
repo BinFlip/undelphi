@@ -258,20 +258,20 @@ fn print_one_class<'a>(bin: &DelphiBinary<'a>, class: &Class<'a>, flavor: VmtFla
     }
 
     // Init table (managed-field layout)
-    if let Some(init) = bin.init_table(class) {
-        if !init.managed_fields.is_empty() {
-            println!(
-                "    init table: record_size={} managed_fields={}",
-                init.record_size,
-                init.managed_fields.len()
-            );
-            for (i, f) in init.managed_fields.iter().enumerate() {
-                let ty = f
-                    .field_type
-                    .map(|h| format!("{} [{:?}]", h.name_str(), h.kind))
-                    .unwrap_or_else(|| format!("0x{:x}", f.type_ref));
-                println!("      [{}] +0x{:x}  {}", i, f.offset, ty);
-            }
+    if let Some(init) = bin.init_table(class)
+        && !init.managed_fields.is_empty()
+    {
+        println!(
+            "    init table: record_size={} managed_fields={}",
+            init.record_size,
+            init.managed_fields.len()
+        );
+        for (i, f) in init.managed_fields.iter().enumerate() {
+            let ty = f
+                .field_type
+                .map(|h| format!("{} [{:?}]", h.name_str(), h.kind))
+                .unwrap_or_else(|| format!("0x{:x}", f.type_ref));
+            println!("      [{}] +0x{:x}  {}", i, f.offset, ty);
         }
     }
 
@@ -567,10 +567,10 @@ fn render_property_value<'a>(
         let mut walker: Option<&Class<'_>> = Some(cls);
         while let Some(c) = walker {
             for rp in bin.properties(c) {
-                if rp.name_str().eq_ignore_ascii_case(prop.name_str()) {
-                    if let Some(detail) = bin.property_type_detail(c, &rp) {
-                        return render_value_with_detail(bin, &prop.value, &detail);
-                    }
+                if rp.name_str().eq_ignore_ascii_case(prop.name_str())
+                    && let Some(detail) = bin.property_type_detail(c, &rp)
+                {
+                    return render_value_with_detail(bin, &prop.value, &detail);
                 }
             }
             walker = c.parent_index.and_then(|idx| bin.classes().get(idx));

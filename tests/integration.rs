@@ -276,14 +276,12 @@ fn heidisql_win64_delphi_12_athens() {
     for (_, obj) in forms {
         if let Some(cl) = classes.find_by_name(obj.class_name_str()) {
             for p in &obj.properties {
-                if p.name_str().starts_with("On") {
-                    if let DfmValue::String(m) = &p.value {
-                        if let Ok(name) = str::from_utf8(m) {
-                            if bin.resolve_event_handler(cl, name).is_some() {
-                                resolved += 1;
-                            }
-                        }
-                    }
+                if p.name_str().starts_with("On")
+                    && let DfmValue::String(m) = &p.value
+                    && let Ok(name) = str::from_utf8(m)
+                    && bin.resolve_event_handler(cl, name).is_some()
+                {
+                    resolved += 1;
                 }
             }
         }

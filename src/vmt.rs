@@ -212,7 +212,7 @@ fn try_parse_delphi<'a>(
         return None;
     }
     let header_bytes = self_ptr - base_va;
-    if header_bytes % (psize as u64) != 0 {
+    if !header_bytes.is_multiple_of(psize as u64) {
         return None;
     }
     let slots = header_bytes / (psize as u64);
