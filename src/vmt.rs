@@ -185,10 +185,7 @@ pub fn scan<'a>(ctx: &BinaryContext<'a>) -> Vec<Vmt<'a>> {
                 continue;
             }
             let mut i = 0usize;
-            loop {
-                let Some(window_end) = i.checked_add(min_header) else {
-                    break;
-                };
+            while let Some(window_end) = i.checked_add(min_header) {
                 if window_end > bytes.len() {
                     break;
                 }

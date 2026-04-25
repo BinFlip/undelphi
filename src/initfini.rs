@@ -272,10 +272,7 @@ fn locate_initfinal_via_scan<'a>(
         };
         // Walk pointer-aligned offsets.
         let mut off = 0usize;
-        loop {
-            let Some(window_end) = off.checked_add(four_ptr) else {
-                break;
-            };
+        while let Some(window_end) = off.checked_add(four_ptr) {
             if window_end > slice.len() {
                 break;
             }
