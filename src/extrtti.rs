@@ -407,7 +407,7 @@ fn iter_class_attributes<'a>(
 /// Modern Delphi RTTI (XE3+) emits the class-level `AttrData` immediately
 /// after the extended-property block. The block is a `u16` length
 /// followed by `length - 2` bytes of packed attribute entries (same
-/// shape as the per-property attribute payloads — see [`decode_attribute_block`]).
+/// shape as the per-property attribute payloads).
 ///
 /// Returns `None` for binaries that don't emit extended RTTI (older
 /// Delphi, or `{$RTTI EXPLICIT}` directives that disable it).
