@@ -40,14 +40,14 @@ pub fn interface_implementors(bin: &DelphiBinary<'_>) -> BTreeMap<String, Vec<St
 pub fn dfm_class_instantiations(bin: &DelphiBinary<'_>) -> BTreeMap<String, Vec<String>> {
     let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (_, root) in bin.forms() {
-        let root_name = root.object_name_str().to_owned();
+        let root_name = root.object_name().to_owned();
         walk_dfm(root, &root_name, &mut out);
     }
     out
 }
 
 fn walk_dfm(obj: &DfmObject<'_>, form_name: &str, out: &mut BTreeMap<String, Vec<String>>) {
-    let class_name = obj.class_name_str().to_owned();
+    let class_name = obj.class_name().to_owned();
     out.entry(class_name)
         .or_default()
         .push(form_name.to_owned());
@@ -84,12 +84,16 @@ pub fn unit_stats(bin: &DelphiBinary<'_>) -> Vec<UnitStats> {
             name: unit.clone(),
             ..Default::default()
         });
-        entry.classes += 1;
-        entry.fields += bin.fields(c).len();
-        entry.methods += bin.methods(c).len();
-        entry.properties += bin.properties(c).len();
-        entry.interfaces += bin.interfaces(c).len();
-        entry.total_instance_bytes += c.instance_size() as u64;
+        // Saturating arithmetic — class counts can never realistically
+        // approach `usize::MAX`, but the lint discipline is universal.
+        entry.classes = entry.classes.saturating_add(1);
+        entry.fields = entry.fields.saturating_add(bin.fields(c).len());
+        entry.methods = entry.methods.saturating_add(bin.methods(c).len());
+        entry.properties = entry.properties.saturating_add(bin.properties(c).len());
+        entry.interfaces = entry.interfaces.saturating_add(bin.interfaces(c).len());
+        entry.total_instance_bytes = entry
+            .total_instance_bytes
+            .saturating_add(c.instance_size() as u64);
     }
     let mut out: Vec<UnitStats> = by_unit.into_values().collect();
     out.sort_by(|a, b| b.classes.cmp(&a.classes).then(a.name.cmp(&b.name)));
@@ -153,7 +157,7 @@ pub fn event_bindings(bin: &DelphiBinary<'_>) -> Vec<HandlerBinding> {
     let forms = bin.forms();
     let mut out = Vec::new();
     for (resource, root) in forms {
-        let root_path = root.object_name_str().to_owned();
+        let root_path = root.object_name().to_owned();
         collect_bindings(bin, root, resource, &root_path, &mut out);
     }
     out
@@ -166,9 +170,9 @@ fn collect_bindings(
     path: &str,
     out: &mut Vec<HandlerBinding>,
 ) {
-    let cls = bin.classes().find_by_name(obj.class_name_str());
+    let cls = bin.classes().find_by_name(obj.class_name());
     for p in &obj.properties {
-        let name = p.name_str();
+        let name = p.name();
         if !name.starts_with("On") {
             continue;
         }
@@ -188,10 +192,10 @@ fn collect_bindings(
         });
     }
     for child in &obj.children {
-        let child_path = if child.object_name_str().is_empty() {
-            format!("{}.{}", path, child.class_name_str())
+        let child_path = if child.object_name().is_empty() {
+            format!("{}.{}", path, child.class_name())
         } else {
-            format!("{}.{}", path, child.object_name_str())
+            format!("{}.{}", path, child.object_name())
         };
         collect_bindings(bin, child, resource, &child_path, out);
     }

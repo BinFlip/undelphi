@@ -19,7 +19,7 @@
 //!
 //! See `RESEARCH.md` §2 for the full identification strategy.
 
-use core::str;
+use std::str;
 
 use crate::formats::BinaryContext;
 
@@ -230,11 +230,7 @@ fn find_embarcadero<'a>(data: &'a [u8]) -> Option<CompilerInfo<'a>> {
     let start = find_bytes(data, EMBARCADERO_PREFIX)?;
 
     // Extend to a printable-ASCII run of up to 256 bytes.
-    let end = start
-        + (start..data.len().min(start + 256))
-            .take_while(|&i| is_printable_ascii(data[i]))
-            .count();
-    let raw = str::from_utf8(&data[start..end]).ok()?;
+    let raw = printable_ascii_run(data, start, 256)?;
 
     // Expected prefixes:
     //   "Embarcadero Delphi for Win64 compiler version 36.0 (29.0.55362.2017)"
@@ -295,20 +291,38 @@ fn find_fpc<'a>(data: &'a [u8]) -> Option<CompilerInfo<'a>> {
     // Scan for every candidate, not just the first — many FPC-built binaries
     // embed multiple FPC strings in `.rodata`. We want the first complete one.
     let mut cursor = 0usize;
-    while let Some(rel) = find_bytes(&data[cursor..], FPC_PREFIX) {
-        let start = cursor + rel;
-        let end = start
-            + (start..data.len().min(start + 160))
-                .take_while(|&i| is_printable_ascii(data[i]))
-                .count();
-        if let Ok(raw) = str::from_utf8(&data[start..end])
+    while let Some(tail) = data.get(cursor..)
+        && let Some(rel) = find_bytes(tail, FPC_PREFIX)
+    {
+        let Some(start) = cursor.checked_add(rel) else {
+            break;
+        };
+        if let Some(raw) = printable_ascii_run(data, start, 160)
             && let Some(info) = parse_fpc_line(raw)
         {
             return Some(info);
         }
-        cursor = start + FPC_PREFIX.len();
+        let Some(next) = start.checked_add(FPC_PREFIX.len()) else {
+            break;
+        };
+        cursor = next;
     }
     None
+}
+
+/// Slice `data` starting at `start` for as long as the bytes are
+/// printable ASCII, capped at `max_len`. Returns the resulting `&str`,
+/// or `None` if the slice is empty or non-UTF-8.
+fn printable_ascii_run(data: &[u8], start: usize, max_len: usize) -> Option<&str> {
+    let cap = start.checked_add(max_len)?.min(data.len());
+    let window = data.get(start..cap)?;
+    let run_len = window
+        .iter()
+        .take_while(|&&b| is_printable_ascii(b))
+        .count();
+    let end = start.checked_add(run_len)?;
+    let body = data.get(start..end)?;
+    str::from_utf8(body).ok()
 }
 
 fn parse_fpc_line<'a>(raw: &'a str) -> Option<CompilerInfo<'a>> {
@@ -371,8 +385,8 @@ const NAMESPACED_MARKERS: &[&[u8]] = &[
 /// returned `raw` borrows the exact matched substring.
 fn find_borland_registry<'a>(data: &'a [u8]) -> Option<CompilerInfo<'a>> {
     let start = find_bytes(data, BORLAND_RTL_MARKER)?;
-    let end = start + BORLAND_RTL_MARKER.len();
-    let raw = str::from_utf8(&data[start..end]).ok()?;
+    let end = start.checked_add(BORLAND_RTL_MARKER.len())?;
+    let raw = str::from_utf8(data.get(start..end)?).ok()?;
     Some(CompilerInfo {
         compiler: Compiler::Delphi,
         version: None,
@@ -390,8 +404,8 @@ fn find_borland_registry<'a>(data: &'a [u8]) -> Option<CompilerInfo<'a>> {
 fn find_namespaced_units<'a>(data: &'a [u8]) -> Option<CompilerInfo<'a>> {
     for marker in NAMESPACED_MARKERS {
         if let Some(start) = find_bytes(data, marker) {
-            let end = start + marker.len();
-            let raw = str::from_utf8(&data[start..end]).ok()?;
+            let end = start.checked_add(marker.len())?;
+            let raw = str::from_utf8(data.get(start..end)?).ok()?;
             return Some(CompilerInfo {
                 compiler: Compiler::Delphi,
                 version: None,
@@ -483,7 +497,7 @@ fn count_tpf0_in_ctx(ctx: &BinaryContext<'_>) -> usize {
             && let Some(slice) = ctx.section_data(&range)
         {
             had_section = true;
-            total += count_tpf0(slice);
+            total = total.saturating_add(count_tpf0(slice));
         }
     }
     if had_section {
@@ -518,15 +532,27 @@ fn count_bytes(haystack: &[u8], needle: &[u8]) -> usize {
     if needle.is_empty() || needle.len() > haystack.len() {
         return 0;
     }
+    let needle_len = needle.len();
+    let Some(last) = haystack.len().checked_sub(needle_len) else {
+        return 0;
+    };
     let mut n = 0usize;
     let mut i = 0usize;
-    let last = haystack.len() - needle.len();
     while i <= last {
-        if &haystack[i..i + needle.len()] == needle {
-            n += 1;
-            i += needle.len();
-        } else {
-            i += 1;
+        let Some(end) = i.checked_add(needle_len) else {
+            break;
+        };
+        match haystack.get(i..end) {
+            Some(window) if window == needle => {
+                n = n.saturating_add(1);
+                i = end;
+            }
+            _ => {
+                let Some(next) = i.checked_add(1) else {
+                    break;
+                };
+                i = next;
+            }
         }
     }
     n

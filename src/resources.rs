@@ -157,10 +157,15 @@ fn pick_language(rsrc_bytes: &[u8], dir_off: usize) -> Option<(u32, ResourceData
 /// Allocates a `String` for the comparison path; string-name lookup is a
 /// cold path so the allocation is acceptable.
 fn read_name(rsrc_bytes: &[u8], off: usize) -> Option<String> {
-    let len_bytes = rsrc_bytes.get(off..off + 2)?;
+    let len_end = off.checked_add(2)?;
+    let len_bytes = rsrc_bytes.get(off..len_end)?;
     let len = u16::from_le_bytes(len_bytes.try_into().ok()?) as usize;
-    let body = rsrc_bytes.get(off + 2..off + 2 + len * 2)?;
-    let iter = (0..len).map(|i| u16::from_le_bytes([body[i * 2], body[i * 2 + 1]]));
+    let body_bytes = len.checked_mul(2)?;
+    let body_end = len_end.checked_add(body_bytes)?;
+    let body = rsrc_bytes.get(len_end..body_end)?;
+    let iter = body
+        .chunks_exact(2)
+        .filter_map(|c| <[u8; 2]>::try_from(c).ok().map(u16::from_le_bytes));
     Some(char::decode_utf16(iter).filter_map(Result::ok).collect())
 }
 
@@ -170,9 +175,12 @@ fn resolve_data<'a>(
     de: &ResourceDataEntry,
     language: u32,
 ) -> Option<ResourceBody<'a>> {
-    let file_off = ctx.va_to_file(ctx.pe.as_ref()?.image_base + de.offset_to_data as u64)?;
+    let pe = ctx.pe.as_ref()?;
+    let va = pe.image_base.checked_add(de.offset_to_data as u64)?;
+    let file_off = ctx.va_to_file(va)?;
     let size = de.size as usize;
-    let data = ctx.data().get(file_off..file_off + size)?;
+    let end = file_off.checked_add(size)?;
+    let data = ctx.data().get(file_off..end)?;
     Some(ResourceBody { data, language })
 }
 

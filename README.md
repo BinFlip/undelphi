@@ -13,7 +13,7 @@ runtime metadata makes reachable — without executing the binary.
 use undelphi::DelphiBinary;
 
 let bytes = std::fs::read("my_app.exe")?;
-if let Some(bin) = DelphiBinary::parse(&bytes) {
+if let Ok(bin) = DelphiBinary::parse(&bytes) {
     if let Some(info) = bin.compiler() {
         println!("{:?} {} on {:?}/{:?}", info.compiler, info.raw, info.os, info.arch);
     }
@@ -131,7 +131,7 @@ use undelphi::DelphiBinary;
 let bin = DelphiBinary::parse(&bytes).unwrap();
 for blob in bin.blobs() {
     println!("{:>6} bytes  {:?}  {}.{}",
-        blob.data.len(), blob.kind, blob.path, blob.property_name);
+        blob.data.len(), blob.kind, blob.path, blob.property_name());
 }
 ```
 

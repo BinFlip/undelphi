@@ -40,13 +40,14 @@
 //! This module honors the `VmtFlavor` tag and dispatches to the right
 //! expected byte when validating `tkClass`.
 
-use core::str;
+use std::str;
 
 use crate::{
-    formats::{BinaryContext, BinaryFormat},
+    detection::TargetArch,
+    formats::BinaryContext,
     interfaces::Guid,
     limits::{MAX_ENUM_RANGE, MAX_IDENTIFIER_BYTES, MAX_METHOD_PARAMS, MAX_RECORD_MANAGED_FIELDS},
-    util::{deref_va, read_ptr, read_short_string_at_file, read_u16},
+    util::{deref_va, read_ptr, read_short_string_at_file, read_short_string_at_va, read_u16},
     vmt::{Vmt, VmtFlavor},
 };
 
@@ -223,7 +224,7 @@ pub struct TkClassInfo<'a> {
     pub kind: TypeKind,
     /// Class name as it appears in the PTypeInfo header (should match the
     /// VMT's own `class_name`).
-    pub class_name: &'a [u8],
+    pub(crate) class_name: &'a [u8],
     /// VA the TypeData's `ClassType` slot points at (should equal the VMT
     /// base address).
     pub class_type_va: u64,
@@ -236,103 +237,121 @@ pub struct TkClassInfo<'a> {
     /// open question, see `RESEARCH.md §14`).
     pub prop_count: i16,
     /// Unit name as a short-string body.
-    pub unit_name: &'a [u8],
+    pub(crate) unit_name: &'a [u8],
     /// File offset where the `TPropData` block starts (needed by iteration
     /// 4 when walking property entries).
     pub prop_data_file_offset: usize,
 }
 
 impl<'a> TkClassInfo<'a> {
-    /// Class name as `&str`, if ASCII.
+    /// Class name as `&str`, lossily decoded.
     #[inline]
-    pub fn class_name_str(&self) -> Option<&'a str> {
-        str::from_utf8(self.class_name).ok()
+    pub fn class_name(&self) -> &'a str {
+        str::from_utf8(self.class_name).unwrap_or("<non-ascii>")
     }
-
-    /// Unit name as `&str`, if ASCII.
+    /// Raw class-name bytes.
     #[inline]
-    pub fn unit_name_str(&self) -> Option<&'a str> {
-        str::from_utf8(self.unit_name).ok()
+    pub fn class_name_bytes(&self) -> &'a [u8] {
+        self.class_name
+    }
+    /// Unit name as `&str`, lossily decoded.
+    #[inline]
+    pub fn unit_name(&self) -> &'a str {
+        str::from_utf8(self.unit_name).unwrap_or("<non-ascii>")
+    }
+    /// Raw unit-name bytes (short-string body).
+    #[inline]
+    pub fn unit_name_bytes(&self) -> &'a [u8] {
+        self.unit_name
     }
 }
 
-/// Decode the `tkClass` TypeInfo record referenced by a class's VMT.
-///
-/// Returns `None` when `vmtTypeInfo` is null, the VA cannot be translated,
-/// the Kind byte is not the `tkClass` value for this flavor, or any length
-/// read fails.
-pub fn tkclass_from_vmt<'a>(ctx: &BinaryContext<'a>, vmt: &Vmt<'a>) -> Option<TkClassInfo<'a>> {
-    if vmt.type_info == 0 {
-        return None;
-    }
-    decode_tkclass(ctx, vmt.type_info, vmt.pointer_size as usize, vmt.flavor)
-}
-
-/// Decode a `tkClass` TypeInfo at an arbitrary VA, given the flavor that
-/// produced the binary (determines which byte value to expect for
-/// `tkClass`).
-pub fn decode_tkclass<'a>(
-    ctx: &BinaryContext<'a>,
-    type_info_va: u64,
-    ptr_size: usize,
-    flavor: VmtFlavor,
-) -> Option<TkClassInfo<'a>> {
-    let file_off = ctx.va_to_file(type_info_va)?;
-    let data = ctx.data();
-
-    let kind_byte = *data.get(file_off)?;
-    if kind_byte != tkclass_byte(flavor) {
-        return None;
-    }
-    // Always tag as Delphi's TypeKind::Class in the returned struct —
-    // callers who need the raw byte use `kind_byte` directly.
-    let kind = TypeKind::Class;
-
-    let class_name = read_short_string_at_file(data, file_off + 1)?;
-    let mut type_data_off = file_off + 2 + class_name.len();
-
-    // On Mach-O and ELF targets FPC sets `FPC_REQUIRES_PROPER_ALIGNMENT`,
-    // which turns off the `packed` attribute on `TTypeData`. The first
-    // TypeData field is pointer-sized (`ClassType: TClass`), so it gets
-    // aligned to a pointer boundary after the preceding `Name: ShortString`.
-    // Windows PE (x86 and x86-64) uses packed records, so no padding.
-    // Source: `reference/fpc-source/rtl/objpas/typinfo.pp:867-871`.
-    if ptr_size > 1 && ctx.format() != BinaryFormat::Pe {
-        let rem = type_data_off % ptr_size;
-        if rem != 0 {
-            type_data_off += ptr_size - rem;
+impl<'a> TkClassInfo<'a> {
+    /// Decode the `tkClass` TypeInfo record referenced by a class's VMT.
+    ///
+    /// Returns `None` when `vmtTypeInfo` is null, the VA cannot be
+    /// translated, the Kind byte is not the `tkClass` value for this
+    /// flavor, or any length read fails.
+    pub fn from_vmt(ctx: &BinaryContext<'a>, vmt: &Vmt<'a>) -> Option<Self> {
+        if vmt.type_info == 0 {
+            return None;
         }
+        Self::from_va(ctx, vmt.type_info, vmt.pointer_size as usize, vmt.flavor)
     }
 
-    // TypeData for tkClass.
-    let class_type_va = read_ptr(data, type_data_off, ptr_size)?;
-    let parent_info_va = read_ptr(data, type_data_off + ptr_size, ptr_size)?;
-    let prop_count_off = type_data_off + 2 * ptr_size;
-    let prop_count = read_u16(data, prop_count_off)? as i16;
-    let unit_name_off = prop_count_off + 2;
-    let unit_name = read_short_string_at_file(data, unit_name_off)?;
-
-    // Validate that the class name looks plausible (identifier-like) so we
-    // don't return garbage from a misaligned TypeInfo.
-    if !is_plausible_identifier(class_name) {
-        return None;
-    }
-    if !is_plausible_identifier(unit_name) {
-        return None;
+    /// Resolve a `ParentInfo` (`PPTypeInfo`) value into the parent
+    /// class's `tkClass` record.
+    pub fn from_parent_info(
+        ctx: &BinaryContext<'a>,
+        parent_info_va: u64,
+        ptr_size: usize,
+        flavor: VmtFlavor,
+    ) -> Option<Self> {
+        let type_info_va = deref_va(ctx, parent_info_va, ptr_size)?;
+        Self::from_va(ctx, type_info_va, ptr_size, flavor)
     }
 
-    let prop_data_file_offset = unit_name_off + 1 + unit_name.len();
+    /// Decode a `tkClass` TypeInfo at an arbitrary VA, given the flavor
+    /// that produced the binary (determines which byte value to expect
+    /// for `tkClass`).
+    pub fn from_va(
+        ctx: &BinaryContext<'a>,
+        type_info_va: u64,
+        ptr_size: usize,
+        flavor: VmtFlavor,
+    ) -> Option<Self> {
+        let file_off = ctx.va_to_file(type_info_va)?;
+        let data = ctx.data();
 
-    Some(TkClassInfo {
-        type_info_va,
-        kind,
-        class_name,
-        class_type_va,
-        parent_info_va,
-        prop_count,
-        unit_name,
-        prop_data_file_offset,
-    })
+        let kind_byte = *data.get(file_off)?;
+        if kind_byte != tkclass_byte(flavor) {
+            return None;
+        }
+        // Always tag as Delphi's TypeKind::Class — callers who need the
+        // raw byte use `kind_byte` directly.
+        let kind = TypeKind::Class;
+
+        let class_name_off = file_off.checked_add(1)?;
+        let class_name = read_short_string_at_file(data, class_name_off)?;
+        let mut type_data_off = file_off.checked_add(2)?.checked_add(class_name.len())?;
+
+        // On Mach-O / ELF targets with `FPC_REQUIRES_PROPER_ALIGNMENT`
+        // the first TypeData field is pointer-aligned after the preceding
+        // `Name: ShortString`. Windows PE packs.
+        // Source: `reference/fpc-source/rtl/objpas/typinfo.pp:867-871`.
+        if ptr_size > 1 && !ctx.format().is_pe() {
+            let rem = type_data_off.checked_rem(ptr_size)?;
+            if rem != 0 {
+                let pad = ptr_size.checked_sub(rem)?;
+                type_data_off = type_data_off.checked_add(pad)?;
+            }
+        }
+
+        let class_type_va = read_ptr(data, type_data_off, ptr_size)?;
+        let parent_info_va_off = type_data_off.checked_add(ptr_size)?;
+        let parent_info_va = read_ptr(data, parent_info_va_off, ptr_size)?;
+        let prop_count_off = parent_info_va_off.checked_add(ptr_size)?;
+        let prop_count = read_u16(data, prop_count_off)? as i16;
+        let unit_name_off = prop_count_off.checked_add(2)?;
+        let unit_name = read_short_string_at_file(data, unit_name_off)?;
+
+        if !is_plausible_identifier(class_name) || !is_plausible_identifier(unit_name) {
+            return None;
+        }
+
+        let prop_data_file_offset = unit_name_off.checked_add(1)?.checked_add(unit_name.len())?;
+
+        Some(Self {
+            type_info_va,
+            kind,
+            class_name,
+            class_type_va,
+            parent_info_va,
+            prop_count,
+            unit_name,
+            prop_data_file_offset,
+        })
+    }
 }
 
 /// Minimal identifier sanity check — same rules as [`crate::vmt`] class
@@ -362,53 +381,63 @@ pub struct TypeHeader<'a> {
     pub kind_byte: u8,
     /// Kind mapped through the flavor into the unified [`TypeKind`] enum.
     pub kind: TypeKind,
-    /// Type name slice borrowed from the input.
-    pub name: &'a [u8],
+    pub(crate) name: &'a [u8],
 }
 
 impl<'a> TypeHeader<'a> {
-    /// Name as `&str`, or `"<non-ascii>"` when bytes are unusual.
-    pub fn name_str(&self) -> &'a str {
+    /// Type name as `&str`, lossily decoded.
+    #[inline]
+    pub fn name(&self) -> &'a str {
         str::from_utf8(self.name).unwrap_or("<non-ascii>")
     }
-}
 
-/// Decode the type header (Kind + Name) at a `PTypeInfo` VA.
-pub fn decode_type_header<'a>(
-    ctx: &BinaryContext<'a>,
-    type_info_va: u64,
-    flavor: VmtFlavor,
-) -> Option<TypeHeader<'a>> {
-    if type_info_va == 0 {
-        return None;
+    /// Raw type-name bytes, borrowed from the input.
+    #[inline]
+    pub fn name_bytes(&self) -> &'a [u8] {
+        self.name
     }
-    let file_off = ctx.va_to_file(type_info_va)?;
-    let data = ctx.data();
-    let kind_byte = *data.get(file_off)?;
-    let kind = classify_kind_byte(kind_byte, flavor);
-    let name = read_short_string_at_file(data, file_off + 1)?;
-    if !is_plausible_identifier(name) {
-        return None;
-    }
-    Some(TypeHeader {
-        va: type_info_va,
-        kind_byte,
-        kind,
-        name,
-    })
-}
 
-/// Follow a `PPTypeInfo` (pointer-to-pointer-to-PTypeInfo) indirection and
-/// return the target type header. Delphi's `PropType` field in
-/// `TPropInfo` is stored as a PPTypeInfo.
-pub fn decode_type_header_from_pptr<'a>(
-    ctx: &BinaryContext<'a>,
-    pptr_va: u64,
-    ptr_size: usize,
-    flavor: VmtFlavor,
-) -> Option<TypeHeader<'a>> {
-    let type_info_va = deref_pptypeinfo(ctx, pptr_va, ptr_size)?;
-    decode_type_header(ctx, type_info_va, flavor)
+    /// Decode the type header (Kind + Name) at a `PTypeInfo` VA.
+    pub fn from_va(ctx: &BinaryContext<'a>, type_info_va: u64, flavor: VmtFlavor) -> Option<Self> {
+        if type_info_va == 0 {
+            return None;
+        }
+        let file_off = ctx.va_to_file(type_info_va)?;
+        let data = ctx.data();
+        let kind_byte = *data.get(file_off)?;
+        let kind = classify_kind_byte(kind_byte, flavor);
+        let name_off = file_off.checked_add(1)?;
+        let name = read_short_string_at_file(data, name_off)?;
+        if !is_plausible_identifier(name) {
+            return None;
+        }
+        Some(Self {
+            va: type_info_va,
+            kind_byte,
+            kind,
+            name,
+        })
+    }
+
+    /// Follow a `PPTypeInfo` (pointer-to-pointer-to-PTypeInfo)
+    /// indirection and return the target type header. Delphi's
+    /// `PropType` field in `TPropInfo` is stored as a `PPTypeInfo`.
+    pub fn from_pptr(
+        ctx: &BinaryContext<'a>,
+        pptr_va: u64,
+        ptr_size: usize,
+        flavor: VmtFlavor,
+    ) -> Option<Self> {
+        let type_info_va = Self::deref_pptypeinfo(ctx, pptr_va, ptr_size)?;
+        Self::from_va(ctx, type_info_va, flavor)
+    }
+
+    /// Dereference a `PPTypeInfo` VA once, returning the `PTypeInfo` VA
+    /// it points at. Returns `None` when either VA is null or unmapped.
+    #[inline]
+    pub fn deref_pptypeinfo(ctx: &BinaryContext<'_>, pp_va: u64, ptr_size: usize) -> Option<u64> {
+        deref_va(ctx, pp_va, ptr_size)
+    }
 }
 
 /// Storage width of an ordinal / enumeration type.
@@ -474,70 +503,88 @@ pub struct EnumInfo<'a> {
     pub base_type_ref: u64,
     /// Enumeration element names in declaration order.
     pub values: Vec<&'a [u8]>,
-    /// Unit name the enumeration was declared in.
-    pub unit_name: Option<&'a [u8]>,
+    pub(crate) unit_name: Option<&'a [u8]>,
 }
 
-/// Decode a `tkEnumeration` record.
-pub fn decode_tkenum<'a>(
-    ctx: &BinaryContext<'a>,
-    type_info_va: u64,
-    flavor: VmtFlavor,
-) -> Option<EnumInfo<'a>> {
-    let header = decode_type_header(ctx, type_info_va, flavor)?;
-    if header.kind != TypeKind::Enumeration {
-        return None;
+impl<'a> EnumInfo<'a> {
+    /// Unit name the enumeration was declared in, as `&str`, lossily
+    /// decoded.
+    #[inline]
+    pub fn unit_name(&self) -> Option<&'a str> {
+        self.unit_name
+            .map(|b| str::from_utf8(b).unwrap_or("<non-ascii>"))
     }
-    let data = ctx.data();
-    let file_off = ctx.va_to_file(type_info_va)?;
-    let mut cursor = file_off + 2 + header.name.len();
-
-    // `OrdType: u8` lives at the start of the tkEnumeration TypeData.
-    let ord_byte = *data.get(cursor)?;
-    let ord = OrdinalType::from_u8(ord_byte);
-    cursor += 1;
-
-    let min = i32::from_le_bytes(data.get(cursor..cursor + 4)?.try_into().ok()?);
-    cursor += 4;
-    let max = i32::from_le_bytes(data.get(cursor..cursor + 4)?.try_into().ok()?);
-    cursor += 4;
-    // BaseTypePtr is a PPTypeInfo.
-    let ptr_size = (ctx.pointer_size().unwrap_or(4)).min(8);
-    let base_type_ref = match ptr_size {
-        8 => u64::from_le_bytes(data.get(cursor..cursor + 8)?.try_into().ok()?),
-        _ => u32::from_le_bytes(data.get(cursor..cursor + 4)?.try_into().ok()?) as u64,
-    };
-    cursor += ptr_size;
-
-    // Plausibility: enum index range must be small.  Use i64 arithmetic
-    // to avoid overflow when `min` / `max` happen to be extreme values
-    // from a misaligned RTTI fragment.
-    let range = (max as i64).checked_sub(min as i64).unwrap_or(i64::MAX);
-    if !(0..=MAX_ENUM_RANGE).contains(&range) {
-        return None;
+    /// Raw unit-name bytes.
+    #[inline]
+    pub fn unit_name_bytes(&self) -> Option<&'a [u8]> {
+        self.unit_name
     }
-    let count = (range + 1) as usize;
-    let mut values = Vec::with_capacity(count);
-    for _ in 0..count {
-        let name = read_short_string_at_file(data, cursor)?;
-        if !is_plausible_identifier(name) {
+}
+
+impl<'a> EnumInfo<'a> {
+    /// Decode a `tkEnumeration` record at `type_info_va`.
+    pub fn from_va(ctx: &BinaryContext<'a>, type_info_va: u64, flavor: VmtFlavor) -> Option<Self> {
+        let header = TypeHeader::from_va(ctx, type_info_va, flavor)?;
+        if header.kind != TypeKind::Enumeration {
             return None;
         }
-        cursor += 1 + name.len();
-        values.push(name);
-    }
-    // Trailing UnitName ShortString.
-    let unit_name = read_short_string_at_file(data, cursor);
+        let data = ctx.data();
+        let file_off = ctx.va_to_file(type_info_va)?;
+        let mut cursor = file_off.checked_add(2)?.checked_add(header.name.len())?;
 
-    Some(EnumInfo {
-        header,
-        ord,
-        min,
-        max,
-        base_type_ref,
-        values,
-        unit_name,
-    })
+        // `OrdType: u8` lives at the start of the tkEnumeration TypeData.
+        let ord_byte = *data.get(cursor)?;
+        let ord = OrdinalType::from_u8(ord_byte);
+        cursor = cursor.checked_add(1)?;
+
+        let min_end = cursor.checked_add(4)?;
+        let min = i32::from_le_bytes(data.get(cursor..min_end)?.try_into().ok()?);
+        cursor = min_end;
+        let max_end = cursor.checked_add(4)?;
+        let max = i32::from_le_bytes(data.get(cursor..max_end)?.try_into().ok()?);
+        cursor = max_end;
+        // BaseTypePtr is a PPTypeInfo. We require a known pointer size
+        // from the parsed container; bail rather than guessing.
+        let ptr_size = ctx.pointer_size()?.min(8);
+        let bt_end = cursor.checked_add(ptr_size)?;
+        let base_type_ref = match ptr_size {
+            8 => u64::from_le_bytes(data.get(cursor..bt_end)?.try_into().ok()?),
+            _ => {
+                let four_end = cursor.checked_add(4)?;
+                u32::from_le_bytes(data.get(cursor..four_end)?.try_into().ok()?) as u64
+            }
+        };
+        cursor = bt_end;
+
+        // Plausibility: enum index range must be small. i64 arithmetic
+        // avoids overflow on extreme min/max from misaligned RTTI.
+        let range = (max as i64).checked_sub(min as i64)?;
+        if !(0..=MAX_ENUM_RANGE).contains(&range) {
+            return None;
+        }
+        let count = range.checked_add(1)? as usize;
+        let mut values = Vec::with_capacity(count);
+        for _ in 0..count {
+            let name = read_short_string_at_file(data, cursor)?;
+            if !is_plausible_identifier(name) {
+                return None;
+            }
+            cursor = cursor.checked_add(1)?.checked_add(name.len())?;
+            values.push(name);
+        }
+        // Trailing UnitName ShortString.
+        let unit_name = read_short_string_at_file(data, cursor);
+
+        Some(Self {
+            header,
+            ord,
+            min,
+            max,
+            base_type_ref,
+            values,
+            unit_name,
+        })
+    }
 }
 
 /// Width of the `Single` / `Double` / `Extended` / `Comp` / `Currency`
@@ -635,8 +682,21 @@ pub struct DynArrayInfo<'a> {
     pub elem_type_ref_any: u64,
     /// Resolved element type header if either VA points at a usable record.
     pub element_type: Option<TypeHeader<'a>>,
-    /// Unit name.
-    pub unit_name: Option<&'a [u8]>,
+    pub(crate) unit_name: Option<&'a [u8]>,
+}
+
+impl<'a> DynArrayInfo<'a> {
+    /// Unit name as `&str`, lossily decoded.
+    #[inline]
+    pub fn unit_name(&self) -> Option<&'a str> {
+        self.unit_name
+            .map(|b| str::from_utf8(b).unwrap_or("<non-ascii>"))
+    }
+    /// Raw unit-name bytes.
+    #[inline]
+    pub fn unit_name_bytes(&self) -> Option<&'a [u8]> {
+        self.unit_name
+    }
 }
 
 /// `tkInterface` — COM-style interface types.
@@ -652,8 +712,21 @@ pub struct InterfaceTypeInfo<'a> {
     pub flags: u8,
     /// Interface GUID.
     pub guid: Guid,
-    /// Unit name.
-    pub unit_name: Option<&'a [u8]>,
+    pub(crate) unit_name: Option<&'a [u8]>,
+}
+
+impl<'a> InterfaceTypeInfo<'a> {
+    /// Unit name as `&str`, lossily decoded.
+    #[inline]
+    pub fn unit_name(&self) -> Option<&'a str> {
+        self.unit_name
+            .map(|b| str::from_utf8(b).unwrap_or("<non-ascii>"))
+    }
+    /// Raw unit-name bytes.
+    #[inline]
+    pub fn unit_name_bytes(&self) -> Option<&'a [u8]> {
+        self.unit_name
+    }
 }
 
 /// One entry in a `tkRecord` managed-fields list.
@@ -740,199 +813,214 @@ impl<'a> TypeDetail<'a> {
     }
 }
 
-/// Dispatcher — decode whichever Kind is stored at `type_info_va`.
-pub fn decode_type_detail<'a>(
-    ctx: &BinaryContext<'a>,
-    type_info_va: u64,
-    flavor: VmtFlavor,
-) -> Option<TypeDetail<'a>> {
-    let header = decode_type_header(ctx, type_info_va, flavor)?;
-    let ptr_size = ctx.pointer_size().unwrap_or(8);
-    let detail = match header.kind {
-        TypeKind::Class => TypeDetail::Class(decode_tkclass(ctx, type_info_va, ptr_size, flavor)?),
-        TypeKind::Enumeration => TypeDetail::Enumeration(decode_tkenum(ctx, type_info_va, flavor)?),
-        TypeKind::Integer | TypeKind::Char | TypeKind::WChar => {
-            TypeDetail::Ordinal(decode_tkordinal(ctx, type_info_va, flavor)?)
+impl<'a> TypeDetail<'a> {
+    /// Dispatcher — decode whichever Kind is stored at `type_info_va`,
+    /// returning the rich per-Kind variant.
+    pub fn from_va(ctx: &BinaryContext<'a>, type_info_va: u64, flavor: VmtFlavor) -> Option<Self> {
+        let header = TypeHeader::from_va(ctx, type_info_va, flavor)?;
+        let ptr_size = ctx.pointer_size().unwrap_or(8);
+        let detail = match header.kind {
+            TypeKind::Class => {
+                Self::Class(TkClassInfo::from_va(ctx, type_info_va, ptr_size, flavor)?)
+            }
+            TypeKind::Enumeration => {
+                Self::Enumeration(EnumInfo::from_va(ctx, type_info_va, flavor)?)
+            }
+            TypeKind::Integer | TypeKind::Char | TypeKind::WChar => {
+                Self::Ordinal(OrdinalInfo::from_va(ctx, type_info_va, flavor)?)
+            }
+            TypeKind::Float => Self::Float(FloatInfo::from_va(ctx, type_info_va, flavor)?),
+            TypeKind::Set => Self::Set(SetInfo::from_va(ctx, type_info_va, flavor)?),
+            TypeKind::ClassRef => Self::ClassRef(ClassRefInfo::from_va(ctx, type_info_va, flavor)?),
+            TypeKind::DynArray => Self::DynArray(DynArrayInfo::from_va(ctx, type_info_va, flavor)?),
+            TypeKind::Interface => {
+                Self::Interface(InterfaceTypeInfo::from_va(ctx, type_info_va, flavor)?)
+            }
+            TypeKind::Record => Self::Record(RecordInfo::from_va(ctx, type_info_va, flavor)?),
+            TypeKind::Method => Self::Method(MethodInfo::from_va(ctx, type_info_va, flavor)?),
+            TypeKind::Procedure => {
+                Self::Procedure(ProcedureInfo::from_va(ctx, type_info_va, flavor)?)
+            }
+            TypeKind::LString | TypeKind::UString | TypeKind::WString => {
+                Self::String(StringInfo::from_va(ctx, type_info_va, flavor)?)
+            }
+            _ => Self::Other(header),
+        };
+        Some(detail)
+    }
+}
+
+impl<'a> OrdinalInfo<'a> {
+    /// Decode a `tkInteger` / `tkChar` / `tkWChar` record.
+    pub fn from_va(ctx: &BinaryContext<'a>, type_info_va: u64, flavor: VmtFlavor) -> Option<Self> {
+        let header = TypeHeader::from_va(ctx, type_info_va, flavor)?;
+        if !matches!(
+            header.kind,
+            TypeKind::Integer | TypeKind::Char | TypeKind::WChar
+        ) {
+            return None;
         }
-        TypeKind::Float => TypeDetail::Float(decode_tkfloat(ctx, type_info_va, flavor)?),
-        TypeKind::Set => TypeDetail::Set(decode_tkset(ctx, type_info_va, flavor)?),
-        TypeKind::ClassRef => TypeDetail::ClassRef(decode_tkclassref(ctx, type_info_va, flavor)?),
-        TypeKind::DynArray => TypeDetail::DynArray(decode_tkdynarray(ctx, type_info_va, flavor)?),
-        TypeKind::Interface => {
-            TypeDetail::Interface(decode_tkinterface(ctx, type_info_va, flavor)?)
+        let data = ctx.data();
+        let off = ctx
+            .va_to_file(type_info_va)?
+            .checked_add(2)?
+            .checked_add(header.name.len())?;
+        let ord = OrdinalType::from_u8(*data.get(off)?);
+        let min_start = off.checked_add(1)?;
+        let min_end = off.checked_add(5)?;
+        let max_end = off.checked_add(9)?;
+        let min = i32::from_le_bytes(data.get(min_start..min_end)?.try_into().ok()?);
+        let max = i32::from_le_bytes(data.get(min_end..max_end)?.try_into().ok()?);
+        Some(Self {
+            header,
+            ord,
+            min,
+            max,
+        })
+    }
+}
+
+impl<'a> FloatInfo<'a> {
+    /// Decode a `tkFloat` record.
+    pub fn from_va(ctx: &BinaryContext<'a>, type_info_va: u64, flavor: VmtFlavor) -> Option<Self> {
+        let header = TypeHeader::from_va(ctx, type_info_va, flavor)?;
+        if header.kind != TypeKind::Float {
+            return None;
         }
-        TypeKind::Record => TypeDetail::Record(decode_tkrecord(ctx, type_info_va, flavor)?),
-        TypeKind::Method => TypeDetail::Method(decode_tkmethod(ctx, type_info_va, flavor)?),
-        TypeKind::Procedure => {
-            TypeDetail::Procedure(decode_tkprocedure(ctx, type_info_va, flavor)?)
+        let data = ctx.data();
+        let off = ctx
+            .va_to_file(type_info_va)?
+            .checked_add(2)?
+            .checked_add(header.name.len())?;
+        let float_type = FloatType::from_u8(*data.get(off)?);
+        Some(Self { header, float_type })
+    }
+}
+
+impl<'a> SetInfo<'a> {
+    /// Decode a `tkSet` record and resolve the element-enumeration
+    /// type, if reachable.
+    pub fn from_va(ctx: &BinaryContext<'a>, type_info_va: u64, flavor: VmtFlavor) -> Option<Self> {
+        let header = TypeHeader::from_va(ctx, type_info_va, flavor)?;
+        if header.kind != TypeKind::Set {
+            return None;
         }
-        TypeKind::LString | TypeKind::UString | TypeKind::WString => {
-            TypeDetail::String(decode_tkstring(ctx, type_info_va, flavor)?)
+        let data = ctx.data();
+        let ptr_size = ctx.pointer_size()?;
+        // tkSet TypeData = { OrdType:u8, CompType:PPTypeInfo, ... }.
+        // We only need the CompType pointer; skip the ordinal byte.
+        let off = ctx
+            .va_to_file(type_info_va)?
+            .checked_add(2)?
+            .checked_add(header.name.len())?
+            .checked_add(1)?;
+        let comp_type_ref = read_ptr(data, off, ptr_size)?;
+        let element_type = TypeHeader::from_pptr(ctx, comp_type_ref, ptr_size, flavor);
+        Some(Self {
+            header,
+            comp_type_ref,
+            element_type,
+        })
+    }
+}
+
+impl<'a> ClassRefInfo<'a> {
+    /// Decode a `tkClassRef` record.
+    pub fn from_va(ctx: &BinaryContext<'a>, type_info_va: u64, flavor: VmtFlavor) -> Option<Self> {
+        let header = TypeHeader::from_va(ctx, type_info_va, flavor)?;
+        if header.kind != TypeKind::ClassRef {
+            return None;
         }
-        _ => TypeDetail::Other(header),
-    };
-    Some(detail)
+        let data = ctx.data();
+        let ptr_size = ctx.pointer_size()?;
+        let off = ctx
+            .va_to_file(type_info_va)?
+            .checked_add(2)?
+            .checked_add(header.name.len())?;
+        let instance_type_ref = read_ptr(data, off, ptr_size)?;
+        let instance_type = TypeHeader::from_pptr(ctx, instance_type_ref, ptr_size, flavor);
+        Some(Self {
+            header,
+            instance_type_ref,
+            instance_type,
+        })
+    }
 }
 
-/// Decode a tkInteger / tkChar / tkWChar record.
-pub fn decode_tkordinal<'a>(
-    ctx: &BinaryContext<'a>,
-    type_info_va: u64,
-    flavor: VmtFlavor,
-) -> Option<OrdinalInfo<'a>> {
-    let header = decode_type_header(ctx, type_info_va, flavor)?;
-    if !matches!(
-        header.kind,
-        TypeKind::Integer | TypeKind::Char | TypeKind::WChar
-    ) {
-        return None;
+impl<'a> DynArrayInfo<'a> {
+    /// Decode a `tkDynArray` record.
+    pub fn from_va(ctx: &BinaryContext<'a>, type_info_va: u64, flavor: VmtFlavor) -> Option<Self> {
+        let header = TypeHeader::from_va(ctx, type_info_va, flavor)?;
+        if header.kind != TypeKind::DynArray {
+            return None;
+        }
+        let data = ctx.data();
+        let ptr_size = ctx.pointer_size()?;
+        let mut off = ctx
+            .va_to_file(type_info_va)?
+            .checked_add(2)?
+            .checked_add(header.name.len())?;
+        let elem_size_end = off.checked_add(4)?;
+        let elem_size = i32::from_le_bytes(data.get(off..elem_size_end)?.try_into().ok()?) as u32;
+        off = elem_size_end;
+        let elem_type_ref_managed = read_ptr(data, off, ptr_size)?;
+        off = off.checked_add(ptr_size)?;
+        // VarType index skipped.
+        off = off.checked_add(4)?;
+        let elem_type_ref_any = read_ptr(data, off, ptr_size)?;
+        off = off.checked_add(ptr_size)?;
+        let unit_name = read_short_string_at_file(data, off);
+        // Pick whichever pointer resolves — `elem_type_ref_any` is
+        // emitted on modern Delphi/FPC even for non-managed elements;
+        // the managed variant can be null.
+        let element_type = if elem_type_ref_any != 0 {
+            TypeHeader::from_pptr(ctx, elem_type_ref_any, ptr_size, flavor)
+        } else {
+            TypeHeader::from_pptr(ctx, elem_type_ref_managed, ptr_size, flavor)
+        };
+        Some(Self {
+            header,
+            elem_size,
+            elem_type_ref_managed,
+            elem_type_ref_any,
+            element_type,
+            unit_name,
+        })
     }
-    let data = ctx.data();
-    let off = ctx.va_to_file(type_info_va)? + 2 + header.name.len();
-    let ord = OrdinalType::from_u8(*data.get(off)?);
-    let min = i32::from_le_bytes(data.get(off + 1..off + 5)?.try_into().ok()?);
-    let max = i32::from_le_bytes(data.get(off + 5..off + 9)?.try_into().ok()?);
-    Some(OrdinalInfo {
-        header,
-        ord,
-        min,
-        max,
-    })
 }
 
-/// Decode a tkFloat record.
-pub fn decode_tkfloat<'a>(
-    ctx: &BinaryContext<'a>,
-    type_info_va: u64,
-    flavor: VmtFlavor,
-) -> Option<FloatInfo<'a>> {
-    let header = decode_type_header(ctx, type_info_va, flavor)?;
-    if header.kind != TypeKind::Float {
-        return None;
+impl<'a> InterfaceTypeInfo<'a> {
+    /// Decode a `tkInterface` record.
+    pub fn from_va(ctx: &BinaryContext<'a>, type_info_va: u64, flavor: VmtFlavor) -> Option<Self> {
+        let header = TypeHeader::from_va(ctx, type_info_va, flavor)?;
+        if header.kind != TypeKind::Interface {
+            return None;
+        }
+        let data = ctx.data();
+        let ptr_size = ctx.pointer_size()?;
+        let mut off = ctx
+            .va_to_file(type_info_va)?
+            .checked_add(2)?
+            .checked_add(header.name.len())?;
+        let parent_ref = read_ptr(data, off, ptr_size)?;
+        off = off.checked_add(ptr_size)?;
+        let flags = *data.get(off)?;
+        off = off.checked_add(1)?;
+        let guid_end = off.checked_add(16)?;
+        let guid_bytes: [u8; 16] = data.get(off..guid_end)?.try_into().ok()?;
+        let guid = Guid::from(guid_bytes);
+        off = guid_end;
+        let unit_name = read_short_string_at_file(data, off);
+        let parent_type = TypeHeader::from_pptr(ctx, parent_ref, ptr_size, flavor);
+        Some(Self {
+            header,
+            parent_ref,
+            parent_type,
+            flags,
+            guid,
+            unit_name,
+        })
     }
-    let data = ctx.data();
-    let off = ctx.va_to_file(type_info_va)? + 2 + header.name.len();
-    let float_type = FloatType::from_u8(*data.get(off)?);
-    Some(FloatInfo { header, float_type })
-}
-
-/// Decode a tkSet record and resolve the element enumeration type, if
-/// possible.
-pub fn decode_tkset<'a>(
-    ctx: &BinaryContext<'a>,
-    type_info_va: u64,
-    flavor: VmtFlavor,
-) -> Option<SetInfo<'a>> {
-    let header = decode_type_header(ctx, type_info_va, flavor)?;
-    if header.kind != TypeKind::Set {
-        return None;
-    }
-    let data = ctx.data();
-    let ptr_size = ctx.pointer_size().unwrap_or(8);
-    // tkSet TypeData = { OrdType:u8, CompType:PPTypeInfo, [Name:ShortString for modern] }.
-    // We only need the CompType pointer; skip the ordinal byte.
-    let off = ctx.va_to_file(type_info_va)? + 2 + header.name.len() + 1;
-    let comp_type_ref = read_ptr(data, off, ptr_size)?;
-    let element_type = decode_type_header_from_pptr(ctx, comp_type_ref, ptr_size, flavor);
-    Some(SetInfo {
-        header,
-        comp_type_ref,
-        element_type,
-    })
-}
-
-/// Decode a tkClassRef record.
-pub fn decode_tkclassref<'a>(
-    ctx: &BinaryContext<'a>,
-    type_info_va: u64,
-    flavor: VmtFlavor,
-) -> Option<ClassRefInfo<'a>> {
-    let header = decode_type_header(ctx, type_info_va, flavor)?;
-    if header.kind != TypeKind::ClassRef {
-        return None;
-    }
-    let data = ctx.data();
-    let ptr_size = ctx.pointer_size().unwrap_or(8);
-    let off = ctx.va_to_file(type_info_va)? + 2 + header.name.len();
-    let instance_type_ref = read_ptr(data, off, ptr_size)?;
-    let instance_type = decode_type_header_from_pptr(ctx, instance_type_ref, ptr_size, flavor);
-    Some(ClassRefInfo {
-        header,
-        instance_type_ref,
-        instance_type,
-    })
-}
-
-/// Decode a tkDynArray record.
-pub fn decode_tkdynarray<'a>(
-    ctx: &BinaryContext<'a>,
-    type_info_va: u64,
-    flavor: VmtFlavor,
-) -> Option<DynArrayInfo<'a>> {
-    let header = decode_type_header(ctx, type_info_va, flavor)?;
-    if header.kind != TypeKind::DynArray {
-        return None;
-    }
-    let data = ctx.data();
-    let ptr_size = ctx.pointer_size().unwrap_or(8);
-    let mut off = ctx.va_to_file(type_info_va)? + 2 + header.name.len();
-    let elem_size = i32::from_le_bytes(data.get(off..off + 4)?.try_into().ok()?) as u32;
-    off += 4;
-    let elem_type_ref_managed = read_ptr(data, off, ptr_size)?;
-    off += ptr_size;
-    // VarType index skipped.
-    off += 4;
-    let elem_type_ref_any = read_ptr(data, off, ptr_size)?;
-    off += ptr_size;
-    let unit_name = read_short_string_at_file(data, off);
-    // Pick whichever pointer resolves — elem_type_ref_any is emitted on
-    // modern Delphi/FPC even for non-managed elements; the managed
-    // variant can be null.
-    let element_type = if elem_type_ref_any != 0 {
-        decode_type_header_from_pptr(ctx, elem_type_ref_any, ptr_size, flavor)
-    } else {
-        decode_type_header_from_pptr(ctx, elem_type_ref_managed, ptr_size, flavor)
-    };
-    Some(DynArrayInfo {
-        header,
-        elem_size,
-        elem_type_ref_managed,
-        elem_type_ref_any,
-        element_type,
-        unit_name,
-    })
-}
-
-/// Decode a tkInterface record.
-pub fn decode_tkinterface<'a>(
-    ctx: &BinaryContext<'a>,
-    type_info_va: u64,
-    flavor: VmtFlavor,
-) -> Option<InterfaceTypeInfo<'a>> {
-    let header = decode_type_header(ctx, type_info_va, flavor)?;
-    if header.kind != TypeKind::Interface {
-        return None;
-    }
-    let data = ctx.data();
-    let ptr_size = ctx.pointer_size().unwrap_or(8);
-    let mut off = ctx.va_to_file(type_info_va)? + 2 + header.name.len();
-    let parent_ref = read_ptr(data, off, ptr_size)?;
-    off += ptr_size;
-    let flags = *data.get(off)?;
-    off += 1;
-    let guid_bytes: [u8; 16] = data.get(off..off + 16)?.try_into().ok()?;
-    let guid = Guid::from_bytes(&guid_bytes);
-    off += 16;
-    let unit_name = read_short_string_at_file(data, off);
-    let parent_type = decode_type_header_from_pptr(ctx, parent_ref, ptr_size, flavor);
-    Some(InterfaceTypeInfo {
-        header,
-        parent_ref,
-        parent_type,
-        flags,
-        guid,
-        unit_name,
-    })
 }
 
 /// Method kind — matches Delphi's `TMethodKind` and FPC's mkXxx constants
@@ -988,22 +1076,32 @@ pub struct MethodParam<'a> {
     /// `Flags` byte — `pfVar`, `pfConst`, `pfArray`, `pfOut`, `pfResult`, etc.
     /// We expose the raw byte; see Embarcadero DocWiki "TParamFlag".
     pub flags: u8,
-    /// Parameter name; borrows from the input.
-    pub name: &'a [u8],
-    /// Parameter type name; borrows from the input. Unlike class RTTI,
-    /// method RTTI stores the parameter's type as a textual identifier
-    /// rather than a PPTypeInfo.
-    pub type_name: &'a [u8],
+    pub(crate) name: &'a [u8],
+    pub(crate) type_name: &'a [u8],
 }
 
 impl<'a> MethodParam<'a> {
-    /// Name as `&str`.
-    pub fn name_str(&self) -> &'a str {
+    /// Parameter name as `&str`, lossily decoded.
+    #[inline]
+    pub fn name(&self) -> &'a str {
         str::from_utf8(self.name).unwrap_or("<non-ascii>")
     }
-    /// Type name as `&str`.
-    pub fn type_name_str(&self) -> &'a str {
+    /// Raw parameter name bytes.
+    #[inline]
+    pub fn name_bytes(&self) -> &'a [u8] {
+        self.name
+    }
+    /// Parameter type name as `&str`, lossily decoded. Unlike class RTTI,
+    /// method RTTI stores the parameter's type as a textual identifier
+    /// rather than a `PPTypeInfo`.
+    #[inline]
+    pub fn type_name(&self) -> &'a str {
         str::from_utf8(self.type_name).unwrap_or("<non-ascii>")
+    }
+    /// Raw parameter type-name bytes.
+    #[inline]
+    pub fn type_name_bytes(&self) -> &'a [u8] {
+        self.type_name
     }
 }
 
@@ -1053,170 +1151,472 @@ pub struct StringInfo<'a> {
     pub code_page: u16,
 }
 
-/// Decode a tkMethod record.
-pub fn decode_tkmethod<'a>(
-    ctx: &BinaryContext<'a>,
-    type_info_va: u64,
-    flavor: VmtFlavor,
-) -> Option<MethodInfo<'a>> {
-    let header = decode_type_header(ctx, type_info_va, flavor)?;
-    if header.kind != TypeKind::Method {
-        return None;
-    }
-    let data = ctx.data();
-    let mut cursor = ctx.va_to_file(type_info_va)? + 2 + header.name.len();
-    let kind = MethodKind::from_u8(*data.get(cursor)?);
-    cursor += 1;
-    let num_params = *data.get(cursor)? as usize;
-    cursor += 1;
-    if num_params > MAX_METHOD_PARAMS {
-        return None;
-    }
-    let mut params = Vec::with_capacity(num_params);
-    for _ in 0..num_params {
-        let flags = *data.get(cursor)?;
-        cursor += 1;
-        let name = read_short_string_at_file(data, cursor)?;
-        cursor += 1 + name.len();
-        let type_name = read_short_string_at_file(data, cursor)?;
-        cursor += 1 + type_name.len();
-        params.push(MethodParam {
-            flags,
-            name,
-            type_name,
-        });
-    }
-    let result_type = if matches!(
-        kind,
-        MethodKind::Function | MethodKind::ClassFunction | MethodKind::SafeFunction
-    ) {
-        read_short_string_at_file(data, cursor)
-    } else {
-        None
-    };
-    Some(MethodInfo {
-        header,
-        kind,
-        params,
-        result_type,
-    })
-}
-
-/// Decode a tkProcedure record. Modern-RTTI-only — older binaries emit
-/// just the header with no parameter info.
-pub fn decode_tkprocedure<'a>(
-    ctx: &BinaryContext<'a>,
-    type_info_va: u64,
-    flavor: VmtFlavor,
-) -> Option<ProcedureInfo<'a>> {
-    let header = decode_type_header(ctx, type_info_va, flavor)?;
-    if header.kind != TypeKind::Procedure {
-        return None;
-    }
-    Some(ProcedureInfo { header })
-}
-
-/// Decode a tkLString / tkUString / tkWString record to recover the code page.
-pub fn decode_tkstring<'a>(
-    ctx: &BinaryContext<'a>,
-    type_info_va: u64,
-    flavor: VmtFlavor,
-) -> Option<StringInfo<'a>> {
-    let header = decode_type_header(ctx, type_info_va, flavor)?;
-    if !matches!(
-        header.kind,
-        TypeKind::LString | TypeKind::UString | TypeKind::WString
-    ) {
-        return None;
-    }
-    let data = ctx.data();
-    let off = ctx.va_to_file(type_info_va)? + 2 + header.name.len();
-    // Pythia records 6 unknown bytes before the code page; empirically on
-    // modern Delphi the bytes are (u16 elem-size, 4 reserved) but we only
-    // need the code-page. Read `u16` at +6.
-    let code_page_off = off + 6;
-    let code_page = data
-        .get(code_page_off..code_page_off + 2)
-        .and_then(|s| <[u8; 2]>::try_from(s).ok())
-        .map(u16::from_le_bytes)
-        .unwrap_or(0);
-    Some(StringInfo { header, code_page })
-}
-
-/// Decode a tkRecord record including its managed-field entries.
-///
-/// Accepts records with an empty on-disk name — the compiler emits
-/// `vmtInitTable` as a synthetic tkRecord with no name whose sole purpose
-/// is to enumerate the host class's managed fields. `decode_type_header`
-/// rejects empty names, so we read the header directly here.
-pub fn decode_tkrecord<'a>(
-    ctx: &BinaryContext<'a>,
-    type_info_va: u64,
-    flavor: VmtFlavor,
-) -> Option<RecordInfo<'a>> {
-    let data = ctx.data();
-    let file_off = ctx.va_to_file(type_info_va)?;
-    let kind_byte = *data.get(file_off)?;
-    if kind_byte
-        != match flavor {
-            VmtFlavor::Delphi => 14, // Delphi tkRecord
-            VmtFlavor::Fpc => 13,    // FPC tkRecord
+impl<'a> MethodInfo<'a> {
+    /// Decode a `tkMethod` record.
+    pub fn from_va(ctx: &BinaryContext<'a>, type_info_va: u64, flavor: VmtFlavor) -> Option<Self> {
+        let header = TypeHeader::from_va(ctx, type_info_va, flavor)?;
+        if header.kind != TypeKind::Method {
+            return None;
         }
-    {
-        return None;
+        let data = ctx.data();
+        let mut cursor = ctx
+            .va_to_file(type_info_va)?
+            .checked_add(2)?
+            .checked_add(header.name.len())?;
+        let kind = MethodKind::from_u8(*data.get(cursor)?);
+        cursor = cursor.checked_add(1)?;
+        let num_params = *data.get(cursor)? as usize;
+        cursor = cursor.checked_add(1)?;
+        if num_params > MAX_METHOD_PARAMS {
+            return None;
+        }
+        let mut params = Vec::with_capacity(num_params);
+        for _ in 0..num_params {
+            let flags = *data.get(cursor)?;
+            cursor = cursor.checked_add(1)?;
+            let name = read_short_string_at_file(data, cursor)?;
+            cursor = cursor.checked_add(1)?.checked_add(name.len())?;
+            let type_name = read_short_string_at_file(data, cursor)?;
+            cursor = cursor.checked_add(1)?.checked_add(type_name.len())?;
+            params.push(MethodParam {
+                flags,
+                name,
+                type_name,
+            });
+        }
+        let result_type = if matches!(
+            kind,
+            MethodKind::Function | MethodKind::ClassFunction | MethodKind::SafeFunction
+        ) {
+            read_short_string_at_file(data, cursor)
+        } else {
+            None
+        };
+        Some(Self {
+            header,
+            kind,
+            params,
+            result_type,
+        })
     }
-    let name = read_short_string_at_file(data, file_off + 1)?;
-    let header = TypeHeader {
-        va: type_info_va,
-        kind_byte,
-        kind: TypeKind::Record,
-        name,
+}
+
+impl<'a> ProcedureInfo<'a> {
+    /// Decode a `tkProcedure` record. Modern-RTTI-only — older
+    /// binaries emit just the header with no parameter info.
+    pub fn from_va(ctx: &BinaryContext<'a>, type_info_va: u64, flavor: VmtFlavor) -> Option<Self> {
+        let header = TypeHeader::from_va(ctx, type_info_va, flavor)?;
+        if header.kind != TypeKind::Procedure {
+            return None;
+        }
+        Some(Self { header })
+    }
+}
+
+impl<'a> StringInfo<'a> {
+    /// Decode a `tkLString` / `tkUString` / `tkWString` record to
+    /// recover the code page.
+    pub fn from_va(ctx: &BinaryContext<'a>, type_info_va: u64, flavor: VmtFlavor) -> Option<Self> {
+        let header = TypeHeader::from_va(ctx, type_info_va, flavor)?;
+        if !matches!(
+            header.kind,
+            TypeKind::LString | TypeKind::UString | TypeKind::WString
+        ) {
+            return None;
+        }
+        let data = ctx.data();
+        let off = ctx
+            .va_to_file(type_info_va)?
+            .checked_add(2)?
+            .checked_add(header.name.len())?;
+        // Pythia records 6 unknown bytes before the code page;
+        // empirically on modern Delphi the bytes are (u16 elem-size,
+        // 4 reserved) but we only need the code page. Read `u16` at
+        // +6. If the slice walks off EOF the type record is
+        // truncated — surface a `None` rather than misreporting code
+        // page 0 (which is valid metadata for legacy ANSI strings,
+        // so 0 must mean "actually 0").
+        let code_page_start = off.checked_add(6)?;
+        let code_page_end = code_page_start.checked_add(2)?;
+        let code_page =
+            u16::from_le_bytes(data.get(code_page_start..code_page_end)?.try_into().ok()?);
+        Some(Self { header, code_page })
+    }
+}
+
+impl<'a> RecordInfo<'a> {
+    /// Decode a `tkRecord` record including its managed-field entries.
+    ///
+    /// Accepts records with an empty on-disk name — the compiler
+    /// emits `vmtInitTable` as a synthetic `tkRecord` with no name
+    /// whose sole purpose is to enumerate the host class's managed
+    /// fields. [`TypeHeader::from_va`] rejects empty names, so we
+    /// read the header directly here.
+    pub fn from_va(ctx: &BinaryContext<'a>, type_info_va: u64, flavor: VmtFlavor) -> Option<Self> {
+        let data = ctx.data();
+        let file_off = ctx.va_to_file(type_info_va)?;
+        let kind_byte = *data.get(file_off)?;
+        if kind_byte
+            != match flavor {
+                VmtFlavor::Delphi => 14, // Delphi tkRecord
+                VmtFlavor::Fpc => 13,    // FPC tkRecord
+            }
+        {
+            return None;
+        }
+        let name_off = file_off.checked_add(1)?;
+        let name = read_short_string_at_file(data, name_off)?;
+        let header = TypeHeader {
+            va: type_info_va,
+            kind_byte,
+            kind: TypeKind::Record,
+            name,
+        };
+        let ptr_size = ctx.pointer_size()?;
+        let mut off = file_off.checked_add(2)?.checked_add(name.len())?;
+        let record_size_end = off.checked_add(4)?;
+        let record_size =
+            i32::from_le_bytes(data.get(off..record_size_end)?.try_into().ok()?) as u32;
+        off = record_size_end;
+        let num_managed_end = off.checked_add(4)?;
+        let num_managed =
+            i32::from_le_bytes(data.get(off..num_managed_end)?.try_into().ok()?) as usize;
+        off = num_managed_end;
+        if num_managed > MAX_RECORD_MANAGED_FIELDS {
+            return None;
+        }
+        let mut managed_fields = Vec::with_capacity(num_managed);
+        for _ in 0..num_managed {
+            let type_ref = read_ptr(data, off, ptr_size)?;
+            off = off.checked_add(ptr_size)?;
+            let offset = read_ptr(data, off, ptr_size)?;
+            off = off.checked_add(ptr_size)?;
+            let field_type = TypeHeader::from_pptr(ctx, type_ref, ptr_size, flavor);
+            managed_fields.push(RecordManagedField {
+                type_ref,
+                offset,
+                field_type,
+            });
+        }
+        Some(Self {
+            header,
+            record_size,
+            managed_fields,
+        })
+    }
+}
+
+/// Sweep the binary's read-only data for every FPC `tkInterface` record
+/// and index them by GUID. Used by
+/// [`crate::DelphiBinary::interface_methods`] to recover per-method
+/// names: the per-class `InterfaceEntry` carries the GUID but no
+/// pointer to the tkInterface PTypeInfo, so we have to find it by
+/// scanning.
+///
+/// On Delphi binaries this returns an empty map — Delphi's classic
+/// `tkInterface` doesn't carry a method table. (Modern extended RTTI
+/// does, on a different layout, not yet supported.)
+///
+/// False-positive guard: each candidate is fully decoded and the GUID
+/// must be non-zero before it's accepted.
+pub fn scan_fpc_tkinterface_index(ctx: &BinaryContext<'_>) -> std::collections::HashMap<Guid, u64> {
+    let mut idx = std::collections::HashMap::new();
+    let Some(_) = ctx.pointer_size() else {
+        return idx;
     };
-    let ptr_size = ctx.pointer_size().unwrap_or(8);
-    let mut off = file_off + 2 + name.len();
-    let record_size = i32::from_le_bytes(data.get(off..off + 4)?.try_into().ok()?) as u32;
-    off += 4;
-    let num_managed = i32::from_le_bytes(data.get(off..off + 4)?.try_into().ok()?) as usize;
-    off += 4;
-    if num_managed > MAX_RECORD_MANAGED_FIELDS {
-        return None;
+    // FPC `tkInterface` kind byte is 14 (per `fpc_kind_from_byte`).
+    const FPC_TK_INTERFACE: u8 = 14;
+    for range in ctx.scan_ranges() {
+        let Some(slice) = ctx.section_data(range) else {
+            continue;
+        };
+        let mut i = 0usize;
+        while i < slice.len() {
+            if slice.get(i).copied() == Some(FPC_TK_INTERFACE)
+                && let Some(va) = range.va.checked_add(i as u64)
+                && let Some(info) = InterfaceTypeInfo::from_va(ctx, va, VmtFlavor::Fpc)
+                && (info.guid.data1 != 0
+                    || info.guid.data2 != 0
+                    || info.guid.data3 != 0
+                    || info.guid.data4 != [0; 8])
+            {
+                idx.entry(info.guid).or_insert(va);
+            }
+            let Some(next) = i.checked_add(1) else {
+                break;
+            };
+            i = next;
+        }
     }
-    let mut managed_fields = Vec::with_capacity(num_managed);
-    for _ in 0..num_managed {
-        let type_ref = read_ptr(data, off, ptr_size)?;
-        off += ptr_size;
-        let offset = read_ptr(data, off, ptr_size)?;
-        off += ptr_size;
-        let field_type = decode_type_header_from_pptr(ctx, type_ref, ptr_size, flavor);
-        managed_fields.push(RecordManagedField {
-            type_ref,
-            offset,
-            field_type,
-        });
-    }
-    Some(RecordInfo {
-        header,
-        record_size,
-        managed_fields,
-    })
+    idx
 }
 
-/// Dereference a `PPTypeInfo` VA once, returning the TypeInfo VA it points
-/// at. Returns `None` when either VA is null or unmapped.
-pub fn deref_pptypeinfo(ctx: &BinaryContext<'_>, pp_va: u64, ptr_size: usize) -> Option<u64> {
-    deref_va(ctx, pp_va, ptr_size)
+/// Header of an FPC `TIntfMethodTable`. The body is a sequence of
+/// [`IntfMethodEntry`] records reachable via [`Self::entries`].
+///
+/// Source: `reference/fpc-source/rtl/objpas/typinfo.pp:429-443`.
+#[derive(Debug, Clone)]
+pub struct IntfMethodTable<'a> {
+    method_count: u16,
+    rtti_count: u16,
+    entries: Vec<IntfMethodEntry<'a>>,
 }
 
-/// Look up a [`TkClassInfo`] by resolving a `ParentInfo` (PPTypeInfo) value.
-pub fn tkclass_from_parent_info<'a>(
-    ctx: &BinaryContext<'a>,
-    parent_info_va: u64,
-    ptr_size: usize,
-    flavor: VmtFlavor,
-) -> Option<TkClassInfo<'a>> {
-    let type_info_va = deref_pptypeinfo(ctx, parent_info_va, ptr_size)?;
-    decode_tkclass(ctx, type_info_va, ptr_size, flavor)
+impl<'a> IntfMethodTable<'a> {
+    /// Decode the method table referenced by an FPC `tkInterface`
+    /// `PTypeInfo` record at `tkintf_va`.
+    ///
+    /// Returns `None` when the layout doesn't parse cleanly. The
+    /// header (`method_count`, `rtti_count`) is recovered even when
+    /// per-method names are absent — `rtti_count == 0xFFFF` means
+    /// the compiler emitted no per-method records, so
+    /// [`Self::entries`] will be empty in that case.
+    pub fn from_tkinterface(ctx: &BinaryContext<'a>, tkintf_va: u64) -> Option<Self> {
+        let header = TypeHeader::from_va(ctx, tkintf_va, VmtFlavor::Fpc)?;
+        if header.kind != TypeKind::Interface {
+            return None;
+        }
+        let ptr_size = ctx.pointer_size()?;
+        let data = ctx.data();
+
+        // FPC's `aligntoptr` is a no-op on architectures without
+        // `FPC_REQUIRES_PROPER_ALIGNMENT` (i.e. x86 / x86_64 in any
+        // container). It only inserts padding on ARM / AArch64 etc.
+        let needs_alignment = !matches!(ctx.target_arch(), TargetArch::X86 | TargetArch::X86_64);
+
+        // Walk past kind(1), namelen(1), name, parent_ref(ptr),
+        // flags(1), guid(16), unit_name(shortstring) → reach
+        // PropertyTable start.
+        let file_off = ctx.va_to_file(tkintf_va)?;
+        let after_name = file_off.checked_add(2)?.checked_add(header.name.len())?;
+        let after_parent = after_name.checked_add(ptr_size)?;
+        let after_flags = after_parent.checked_add(1)?;
+        let after_guid = after_flags.checked_add(16)?;
+        let unit_name_len = *data.get(after_guid)? as usize;
+        let after_unit_name = after_guid.checked_add(1)?.checked_add(unit_name_len)?;
+
+        // PropertyTable starts here.
+        let prop_table_off = align_to_ptr(after_unit_name, ptr_size, needs_alignment)?;
+
+        // TPropData: u16 count, then variable-length entries. We bail
+        // on non-empty published-property tables — interfaces with
+        // published properties are vanishingly rare, and walking past
+        // them needs a flavor-specific TPropInfo decoder we don't
+        // duplicate here.
+        let prop_count = read_u16(data, prop_table_off)? as usize;
+        if prop_count != 0 {
+            return None;
+        }
+        let after_prop_data = prop_table_off.checked_add(2)?;
+
+        // MethodTable starts at aligntoptr(PropertyTable.Tail).
+        let method_table_off = align_to_ptr(after_prop_data, ptr_size, needs_alignment)?;
+
+        // TIntfMethodTable: u16 count, u16 rtti_count.
+        let method_count = read_u16(data, method_table_off)?;
+        let rtti_count = read_u16(data, method_table_off.checked_add(2)?)?;
+
+        if method_count as usize > MAX_INTF_METHODS {
+            return None;
+        }
+
+        // `rtti_count == 0xFFFF` is the documented "no per-method RTTI"
+        // sentinel — the compiler knows the slot count but emitted no
+        // metadata for any individual method.
+        if rtti_count == u16::MAX || rtti_count == 0 {
+            return Some(Self {
+                method_count,
+                rtti_count,
+                entries: Vec::new(),
+            });
+        }
+
+        let entries_start = method_table_off.checked_add(4)?;
+        let mut entry_off = align_to_ptr(entries_start, ptr_size, needs_alignment)?;
+
+        let walk_count = rtti_count.min(method_count) as usize;
+        let mut entries = Vec::with_capacity(walk_count);
+        for slot in 0..walk_count {
+            // TIntfMethodEntry layout (no HAVE_INVOKEHELPER on the
+            // platforms we target):
+            //   ResultType: PPTypeInfo  (ptr)
+            //   CC: u8
+            //   Kind: u8
+            //   ParamCount: u16
+            //   StackSize: SizeInt      (ptr-sized)
+            //   NamePtr: PShortString   (ptr)
+            let cc_off = entry_off.checked_add(ptr_size)?;
+            let kind_off = cc_off.checked_add(1)?;
+            let param_count_off = kind_off.checked_add(1)?;
+            let stack_size_off = param_count_off.checked_add(2)?;
+            let name_ptr_off = stack_size_off.checked_add(ptr_size)?;
+
+            let result_type_ref = read_ptr(data, entry_off, ptr_size)?;
+            let calling_convention = *data.get(cc_off)?;
+            let kind_byte = *data.get(kind_off)?;
+            let param_count = read_u16(data, param_count_off)?;
+            let stack_size = read_ptr(data, stack_size_off, ptr_size)?;
+            let name_ptr = read_ptr(data, name_ptr_off, ptr_size)?;
+            let name = read_short_string_at_va(ctx, name_ptr)?;
+
+            entries.push(IntfMethodEntry {
+                slot: slot as u16,
+                result_type_ref,
+                calling_convention,
+                kind_byte,
+                kind: MethodKind::from_u8(kind_byte),
+                param_count,
+                stack_size,
+                name,
+            });
+
+            // Bail on parametered methods (the inline
+            // `TVmtMethodParam` walker would duplicate the method-RTTI
+            // decoder); the partial list up to the first parametered
+            // method is still useful for naming purposes.
+            if param_count != 0 {
+                break;
+            }
+            let after_entry_base = name_ptr_off.checked_add(ptr_size)?;
+            // ResultLocs is present when ResultType is non-null.
+            let after_entry = if result_type_ref != 0 {
+                after_entry_base.checked_add(ptr_size)?
+            } else {
+                after_entry_base
+            };
+            entry_off = align_to_ptr(after_entry, ptr_size, needs_alignment)?;
+        }
+
+        Some(Self {
+            method_count,
+            rtti_count,
+            entries,
+        })
+    }
+
+    /// Total number of slots in the interface's vtable (matches the
+    /// Delphi `Methods` count).
+    #[inline]
+    pub fn method_count(&self) -> u16 {
+        self.method_count
+    }
+
+    /// Number of entries that carry per-method RTTI metadata. Equal
+    /// to [`Self::method_count`] when full RTTI was emitted; `0xFFFF`
+    /// when the compiler emitted no per-method records (interfaces
+    /// declared without `{$M+}` mode in their source unit). When the
+    /// sentinel is set, [`Self::entries`] returns an empty slice —
+    /// the vtable still has `method_count` slots, but their names
+    /// are not recoverable from this RTTI.
+    #[inline]
+    pub fn rtti_count(&self) -> u16 {
+        self.rtti_count
+    }
+
+    /// Per-method RTTI records, one per slot. Empty when
+    /// `rtti_count == 0xFFFF`.
+    #[inline]
+    pub fn entries(&self) -> &[IntfMethodEntry<'a>] {
+        &self.entries
+    }
 }
+
+/// One entry in an FPC `tkInterface` method table.
+///
+/// Source: `reference/fpc-source/rtl/objpas/typinfo.pp:398-427`
+/// (`TIntfMethodEntry`). We don't decode parameters here — the entry
+/// is variable-length, and we bail past entries that declare any
+/// parameter so the simple shape stays clean.
+#[derive(Debug, Clone, Copy)]
+pub struct IntfMethodEntry<'a> {
+    slot: u16,
+    result_type_ref: u64,
+    calling_convention: u8,
+    kind_byte: u8,
+    kind: MethodKind,
+    param_count: u16,
+    stack_size: u64,
+    name: &'a [u8],
+}
+
+impl<'a> IntfMethodEntry<'a> {
+    /// Slot index within the interface's vtable.
+    #[inline]
+    pub fn slot(&self) -> u16 {
+        self.slot
+    }
+
+    /// Method name as `&str`, lossily decoded.
+    #[inline]
+    pub fn name(&self) -> &'a str {
+        str::from_utf8(self.name).unwrap_or("<non-ascii>")
+    }
+
+    /// Raw method-name bytes (the on-disk shortstring body).
+    #[inline]
+    pub fn name_bytes(&self) -> &'a [u8] {
+        self.name
+    }
+
+    /// `PPTypeInfo` VA of the result type, or `0` for procedures.
+    #[inline]
+    pub fn result_type_ref(&self) -> u64 {
+        self.result_type_ref
+    }
+
+    /// Calling-convention byte (`TCallConv`).
+    #[inline]
+    pub fn calling_convention(&self) -> u8 {
+        self.calling_convention
+    }
+
+    /// Raw method-kind byte (`TMethodKind`).
+    #[inline]
+    pub fn kind_byte(&self) -> u8 {
+        self.kind_byte
+    }
+
+    /// Method kind mapped through [`MethodKind`].
+    #[inline]
+    pub fn kind(&self) -> MethodKind {
+        self.kind
+    }
+
+    /// Number of formal parameters declared in source. When non-zero
+    /// the parameter records aren't decoded; future iterations may
+    /// expose them.
+    #[inline]
+    pub fn param_count(&self) -> u16 {
+        self.param_count
+    }
+
+    /// Stack-bytes consumed by the call (FPC
+    /// `TIntfMethodEntry.StackSize`).
+    #[inline]
+    pub fn stack_size(&self) -> u64 {
+        self.stack_size
+    }
+}
+
+/// Pointer-align `off` to the next multiple of `ptr_size`. When
+/// `apply_alignment` is `false` (Windows PE, where FPC packs records),
+/// returns `off` unchanged.
+fn align_to_ptr(off: usize, ptr_size: usize, apply_alignment: bool) -> Option<usize> {
+    if !apply_alignment || ptr_size == 0 {
+        return Some(off);
+    }
+    let rem = off.checked_rem(ptr_size)?;
+    if rem == 0 {
+        Some(off)
+    } else {
+        let pad = ptr_size.checked_sub(rem)?;
+        off.checked_add(pad)
+    }
+}
+
+/// Hard cap on FPC interface method-table entries — guards against
+/// adversarially-large `Count` fields.
+const MAX_INTF_METHODS: usize = 1024;
 
 #[cfg(test)]
 mod tests {

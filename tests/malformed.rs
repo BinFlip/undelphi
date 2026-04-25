@@ -9,16 +9,13 @@
 //! returns.
 
 use undelphi::{
-    DelphiBinary,
-    dfm::{parse as parse_dfm, parse_body},
-    dvclal, extrtti,
-    formats::BinaryContext,
+    DelphiBinary, dfm::DfmObject, dvclal, extrtti::AttributeEntry, formats::BinaryContext,
     fpcresources, packageinfo,
 };
 
 #[test]
 fn parse_empty() {
-    assert!(DelphiBinary::parse(&[]).is_none());
+    assert!(DelphiBinary::parse(&[]).is_err());
 }
 
 #[test]
@@ -145,7 +142,7 @@ fn packageinfo_cstr_unterminated_does_not_panic() {
 fn dfm_rejects_non_magic() {
     let cases: &[&[u8]] = &[b"", b"TP", b"TPF", b"NOTF", b"TPF2", b"\0\0\0\0"];
     for case in cases {
-        assert!(parse_dfm(case).is_none());
+        assert!(DfmObject::parse(case).is_none());
     }
 }
 
@@ -164,9 +161,9 @@ fn dfm_random_trailing_bytes_dont_panic() {
                 .wrapping_add(1);
             buf.push((state >> 33) as u8);
         }
-        let _ = parse_dfm(&buf);
-        let _ = parse_body(&buf[4..], false);
-        let _ = parse_body(&buf[4..], true);
+        let _ = DfmObject::parse(&buf);
+        let _ = DfmObject::parse_body(&buf[4..], false);
+        let _ = DfmObject::parse_body(&buf[4..], true);
     }
 }
 
@@ -174,7 +171,7 @@ fn dfm_random_trailing_bytes_dont_panic() {
 fn dfm_truncated_after_header() {
     // Valid magic + class-name length byte that claims more bytes than exist.
     let bad = b"TPF0\xff\x00";
-    assert!(parse_dfm(bad).is_none());
+    assert!(DfmObject::parse(bad).is_none());
 }
 
 #[test]
@@ -191,7 +188,7 @@ fn attribute_block_handles_truncation() {
     // Too small to hold a single entry.
     for len in 0..17 {
         let v = vec![0u8; len];
-        let (entries, consumed) = extrtti::decode_attribute_block(&v, 8);
+        let (entries, consumed) = AttributeEntry::decode_block(&v, 8);
         assert!(entries.is_empty());
         assert!(consumed <= v.len());
     }
@@ -206,7 +203,7 @@ fn attribute_block_handles_huge_arg_len() {
     v.extend_from_slice(&0u64.to_le_bytes()); // AttrCtor
     v.extend_from_slice(&0xffffu16.to_le_bytes()); // ArgLen
     v.extend_from_slice(b"\x00\x00\x00\x00\x00");
-    let (entries, _) = extrtti::decode_attribute_block(&v, 8);
+    let (entries, _) = AttributeEntry::decode_block(&v, 8);
     // Must not panic, and must not yield the bogus entry because the
     // declared body overruns.
     assert!(entries.is_empty());
@@ -229,6 +226,6 @@ fn dfm_claims_all_value_types_without_panic() {
         // The parser must return None without panicking.
         s.push(0); // end props
         s.push(0); // end children
-        let _ = parse_dfm(&s);
+        let _ = DfmObject::parse(&s);
     }
 }

@@ -8,22 +8,40 @@
 //! This module walks every parsed DFM, surfaces every [`DfmValue::Binary`]
 //! leaf, and classifies it by magic bytes.
 
-use crate::dfm::{DfmObject, DfmValue};
+use std::fmt;
+
+use crate::dfm::{DfmObject, DfmProperty, DfmValue};
 
 /// One blob extracted from a DFM property.
+///
+/// Borrows from the parsed form tree (`'b`) and the input binary buffer
+/// (`'a`). The dotted path can be reconstructed on demand via
+/// [`EmbeddedBlob::path`] when needed.
 #[derive(Debug, Clone)]
-pub struct EmbeddedBlob<'a> {
+pub struct EmbeddedBlob<'a, 'b> {
     /// Resource name that contained the root form (e.g. `TMAINFORM`).
-    pub form_resource: String,
-    /// Path of the component this property belongs to, e.g.
-    /// `MainForm.btnAbout.Icon`.
-    pub path: String,
-    /// Name of the property carrying this blob.
-    pub property_name: String,
+    pub form_resource: &'b str,
+    /// The component this property belongs to (zero-copy reference into
+    /// the parsed form tree).
+    pub component: &'b DfmObject<'a>,
+    /// The property carrying this blob.
+    pub property: &'b DfmProperty<'a>,
     /// Format identified from the first 16 bytes.
     pub kind: BlobKind,
     /// Raw blob bytes; borrowed from the input binary.
     pub data: &'a [u8],
+    /// Dotted path of the component, pre-computed at catalog time so
+    /// callers don't need to re-walk the tree.
+    pub path: String,
+}
+
+impl<'a, 'b> EmbeddedBlob<'a, 'b> {
+    /// Name of the property carrying this blob — convenience that
+    /// forwards to [`DfmProperty::name`].
+    #[inline]
+    pub fn property_name(&self) -> &'a str {
+        self.property.name()
+    }
 }
 
 /// Format classification for an embedded blob — derived from magic bytes.
@@ -106,8 +124,9 @@ impl BlobKind {
         if b.starts_with(b"\xcf\xfa\xed\xfe") || b.starts_with(b"\xfe\xed\xfa\xcf") {
             return BlobKind::MachO;
         }
-        if b.starts_with(b"RIFF") && b.len() >= 12 {
-            let sub = &b[8..12];
+        if b.starts_with(b"RIFF")
+            && let Some(sub) = b.get(8..12)
+        {
             if sub == b"WAVE" {
                 return BlobKind::Wav;
             }
@@ -119,7 +138,13 @@ impl BlobKind {
         if b.starts_with(b"\xff\xd8\xff") {
             return BlobKind::Jpeg;
         }
-        if b.starts_with(b"ID3") || (b.len() >= 2 && b[0] == 0xff && b[1] & 0xe0 == 0xe0) {
+        if b.starts_with(b"ID3") {
+            return BlobKind::Mp3;
+        }
+        if let (Some(&b0), Some(&b1)) = (b.first(), b.get(1))
+            && b0 == 0xff
+            && b1 & 0xe0 == 0xe0
+        {
             return BlobKind::Mp3;
         }
         if b.starts_with(b"\x1f\x8b") {
@@ -134,8 +159,13 @@ impl BlobKind {
         if b.starts_with(b"\xd7\xcd\xc6\x9a") {
             return BlobKind::Metafile;
         }
-        if b.len() >= 4 && b[0] == 0 && b[1] == 0 && b[3] == 0 {
-            match b[2] {
+        if let (Some(&b0), Some(&b1), Some(&b2), Some(&b3)) =
+            (b.first(), b.get(1), b.get(2), b.get(3))
+            && b0 == 0
+            && b1 == 0
+            && b3 == 0
+        {
+            match b2 {
                 1 => return BlobKind::Icon,
                 2 => return BlobKind::Cursor,
                 _ => {}
@@ -145,11 +175,10 @@ impl BlobKind {
             return BlobKind::Pe;
         }
         if let Some(&len) = b.first()
-            && (len as usize) < b.len()
             && len > 0
-            && b[1..=len as usize]
-                .iter()
-                .all(|&c| (0x20..=0x7e).contains(&c))
+            && let Some(end) = (len as usize).checked_add(1)
+            && let Some(body) = b.get(1..end)
+            && body.iter().all(|&c| (0x20..=0x7e).contains(&c))
         {
             return BlobKind::ShortString;
         }
@@ -185,38 +214,52 @@ impl BlobKind {
     }
 }
 
+impl fmt::Display for BlobKind {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
 /// Enumerate every embedded-binary value across every parsed form.
 ///
 /// Takes the pre-extracted forms list so the caller controls lifetime.
-/// Typical call: `catalog(bin.forms())`. Returned blob bytes borrow
-/// directly from the input binary's lifetime `'a`, independent of the
-/// shorter lifetime of the borrow into the forms slice.
-pub fn catalog<'a>(forms: &[(String, DfmObject<'a>)]) -> Vec<EmbeddedBlob<'a>> {
+/// Typical call: `catalog(bin.forms())`. Each returned blob carries
+/// borrowed references back into the form tree (`component`, `property`)
+/// so the consumer can attach the blob to its owning component without
+/// re-walking. Blob bytes themselves still borrow from the input binary.
+pub fn catalog<'a, 'b>(forms: &'b [(String, DfmObject<'a>)]) -> Vec<EmbeddedBlob<'a, 'b>> {
     let mut out = Vec::new();
     for (name, root) in forms {
-        let root_path = root.object_name_str().to_owned();
+        let root_path = root.object_name().to_owned();
         walk(root, name, &root_path, &mut out);
     }
     out
 }
 
-fn walk<'a>(obj: &DfmObject<'a>, form_resource: &str, path: &str, out: &mut Vec<EmbeddedBlob<'a>>) {
+fn walk<'a, 'b>(
+    obj: &'b DfmObject<'a>,
+    form_resource: &'b str,
+    path: &str,
+    out: &mut Vec<EmbeddedBlob<'a, 'b>>,
+) {
     for p in &obj.properties {
         if let DfmValue::Binary(data) = &p.value {
             out.push(EmbeddedBlob {
-                form_resource: form_resource.to_owned(),
-                path: path.to_owned(),
-                property_name: p.name_str().to_owned(),
+                form_resource,
+                component: obj,
+                property: p,
                 kind: BlobKind::from_bytes(data),
                 data,
+                path: path.to_owned(),
             });
         }
     }
     for child in &obj.children {
-        let child_path = if child.object_name_str().is_empty() {
-            format!("{}.{}", path, child.class_name_str())
+        let child_path = if child.object_name().is_empty() {
+            format!("{}.{}", path, child.class_name())
         } else {
-            format!("{}.{}", path, child.object_name_str())
+            format!("{}.{}", path, child.object_name())
         };
         walk(child, form_resource, &child_path, out);
     }

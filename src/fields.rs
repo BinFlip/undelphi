@@ -55,10 +55,10 @@
 //!
 //! The field-name slice borrows from the caller's byte buffer.
 
-use core::str;
+use std::str;
 
 use crate::{
-    formats::{BinaryContext, BinaryFormat},
+    formats::BinaryContext,
     limits::{MAX_FIELDS_PER_CLASS, MAX_IDENTIFIER_BYTES},
     util::{read_ptr, read_short_string_at_file, read_u16, read_u32},
     vmt::{Vmt, VmtFlavor},
@@ -74,13 +74,21 @@ pub struct Field<'a> {
     /// into the class-types array (legacy Delphi).
     pub type_ref: FieldTypeRef,
     /// Field name; borrows from the input buffer.
-    pub name: &'a [u8],
+    pub(crate) name: &'a [u8],
 }
 
 impl<'a> Field<'a> {
-    /// Name as `&str`.
-    pub fn name_str(&self) -> &'a str {
+    /// Field name as `&str`, lossily decoded. Pascal identifiers are ASCII
+    /// in practice; non-UTF-8 bytes fall back to `"<non-ascii>"`.
+    #[inline]
+    pub fn name(&self) -> &'a str {
         str::from_utf8(self.name).unwrap_or("<non-ascii>")
+    }
+
+    /// Raw field name bytes (borrows from the input buffer).
+    #[inline]
+    pub fn name_bytes(&self) -> &'a [u8] {
+        self.name
     }
 }
 
@@ -93,14 +101,26 @@ pub enum FieldTypeRef {
     TypeIndex(u16),
 }
 
-/// Decode every published field of `vmt`.
-pub fn iter_fields<'a>(ctx: &BinaryContext<'a>, vmt: &Vmt<'a>) -> Vec<Field<'a>> {
-    if vmt.field_table == 0 {
-        return Vec::new();
-    }
-    match vmt.flavor {
-        VmtFlavor::Delphi => iter_delphi(ctx, vmt).unwrap_or_default(),
-        VmtFlavor::Fpc => iter_fpc(ctx, vmt).unwrap_or_default(),
+impl<'a> Field<'a> {
+    /// Decode every published field declared on `vmt`. Returns an
+    /// empty vector if the class has no field table or the table is
+    /// malformed.
+    pub fn iter(ctx: &BinaryContext<'a>, vmt: &Vmt<'a>) -> Vec<Self> {
+        if vmt.field_table == 0 {
+            return Vec::new();
+        }
+        let result = match vmt.flavor {
+            VmtFlavor::Delphi => iter_delphi(ctx, vmt),
+            VmtFlavor::Fpc => iter_fpc(ctx, vmt),
+        };
+        result.unwrap_or_else(|| {
+            crate::__undelphi_trace_warn!(
+                vmt_va = vmt.va,
+                field_table = vmt.field_table,
+                "Field::iter: field-table walk bailed out"
+            );
+            Vec::new()
+        })
     }
 }
 
@@ -111,7 +131,7 @@ fn iter_delphi<'a>(ctx: &BinaryContext<'a>, vmt: &Vmt<'a>) -> Option<Vec<Field<'
     let psize = vmt.pointer_size as usize;
     if header == 0 {
         // Modern layout.
-        read_modern_delphi(data, base_off + 2, psize)
+        read_modern_delphi(data, base_off.checked_add(2)?, psize)
     } else {
         // Legacy layout.
         read_legacy_delphi(data, base_off, header as usize, psize)
@@ -132,21 +152,22 @@ fn read_legacy_delphi(
     if count == 0 || count > MAX_FIELDS_PER_CLASS {
         return Some(Vec::new());
     }
-    let mut cursor = base_off + 2 + psize;
+    let mut cursor = base_off.checked_add(2)?.checked_add(psize)?;
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
         let offset = read_u32(data, cursor)?;
-        let type_index = read_u16(data, cursor + 4)?;
-        let name = read_short_string_at_file(data, cursor + 6)?;
+        let type_index = read_u16(data, cursor.checked_add(4)?)?;
+        let name = read_short_string_at_file(data, cursor.checked_add(6)?)?;
         if !is_plausible_name(name) {
             return None;
         }
+        let advance = 6usize.checked_add(1)?.checked_add(name.len())?;
         out.push(Field {
             offset,
             type_ref: FieldTypeRef::TypeIndex(type_index),
             name,
         });
-        cursor += 6 + 1 + name.len();
+        cursor = cursor.checked_add(advance)?;
     }
     Some(out)
 }
@@ -157,7 +178,9 @@ fn read_modern_delphi(data: &[u8], after_header: usize, psize: usize) -> Option<
     // empirically the count is sometimes at +0 and sometimes at +4.
     // Probe both offsets and accept whichever yields a plausible count.
     for unk2_skip in [4usize, 0usize] {
-        let count_off = after_header + unk2_skip;
+        let Some(count_off) = after_header.checked_add(unk2_skip) else {
+            continue;
+        };
         let Some(count) = read_u16(data, count_off) else {
             continue;
         };
@@ -165,7 +188,10 @@ fn read_modern_delphi(data: &[u8], after_header: usize, psize: usize) -> Option<
         if count == 0 || count > MAX_FIELDS_PER_CLASS {
             continue;
         }
-        let Some(fields) = try_modern_entries(data, count_off + 2, count, psize) else {
+        let Some(entries_off) = count_off.checked_add(2) else {
+            continue;
+        };
+        let Some(fields) = try_modern_entries(data, entries_off, count, psize) else {
             continue;
         };
         return Some(fields);
@@ -190,25 +216,33 @@ fn try_modern_entries(
         //   num_extra: u16
         //   extra: [num_extra - 2] bytes
         let _unk1 = *data.get(cursor)?;
-        let type_ref_va = read_ptr(data, cursor + 1, psize)?;
-        let offset = read_u32(data, cursor + 1 + psize)?;
-        let name_off = cursor + 1 + psize + 4;
+        let type_ref_off = cursor.checked_add(1)?;
+        let offset_off = type_ref_off.checked_add(psize)?;
+        let name_off = offset_off.checked_add(4)?;
+        let type_ref_va = read_ptr(data, type_ref_off, psize)?;
+        let offset = read_u32(data, offset_off)?;
         let name = read_short_string_at_file(data, name_off)?;
         if !is_plausible_name(name) {
             return None;
         }
-        let after_name = name_off + 1 + name.len();
+        let after_name = name_off.checked_add(1)?.checked_add(name.len())?;
         let num_extra = read_u16(data, after_name)? as usize;
         if num_extra < 2 {
             return None;
         }
-        let record_size = (1 + psize + 4) + 1 + name.len() + num_extra;
+        // record_size = unk1(1) + typeinfo_ptr(psize) + offset(4) + name(1+len) + extra(num_extra)
+        let record_size = 1usize
+            .checked_add(psize)?
+            .checked_add(4)?
+            .checked_add(1)?
+            .checked_add(name.len())?
+            .checked_add(num_extra)?;
         out.push(Field {
             offset,
             type_ref: FieldTypeRef::TypeInfoPtr(type_ref_va),
             name,
         });
-        cursor += record_size;
+        cursor = cursor.checked_add(record_size)?;
     }
     Some(out)
 }
@@ -226,29 +260,36 @@ fn iter_fpc<'a>(ctx: &BinaryContext<'a>, vmt: &Vmt<'a>) -> Option<Vec<Field<'a>>
     // after the `Count: u16`, which inserts `ptr_size - 2` bytes of padding.
     // On PE packs are kept.
     let needs_alignment = ptr_aligned_on_non_x86(ctx);
+    let after_count = base_off.checked_add(2)?;
     let classtab_off = if needs_alignment {
-        align_up(base_off + 2, psize)
+        align_up(after_count, psize)?
     } else {
-        base_off + 2
+        after_count
     };
-    let mut cursor = classtab_off + psize;
+    let mut cursor = classtab_off.checked_add(psize)?;
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
         if needs_alignment {
-            cursor = align_up(cursor, psize);
+            cursor = align_up(cursor, psize)?;
         }
         let offset = read_ptr(data, cursor, psize)? as u32;
-        let type_index = read_u16(data, cursor + psize)?;
-        let name = read_short_string_at_file(data, cursor + psize + 2)?;
+        let ti_off = cursor.checked_add(psize)?;
+        let name_off = ti_off.checked_add(2)?;
+        let type_index = read_u16(data, ti_off)?;
+        let name = read_short_string_at_file(data, name_off)?;
         if !is_plausible_name(name) {
             return None;
         }
+        let advance = psize
+            .checked_add(2)?
+            .checked_add(1)?
+            .checked_add(name.len())?;
         out.push(Field {
             offset,
             type_ref: FieldTypeRef::TypeIndex(type_index),
             name,
         });
-        cursor += psize + 2 + 1 + name.len();
+        cursor = cursor.checked_add(advance)?;
     }
     Some(out)
 }
@@ -257,13 +298,21 @@ fn ptr_aligned_on_non_x86(ctx: &BinaryContext<'_>) -> bool {
     // Mach-O and ELF binaries on ARM / ARM64 get FPC's proper-alignment
     // mode. We approximate by "not PE" since Mach-O on ARM is our main
     // case. PE (Windows) always uses x86/x86-64 where FPC keeps packed.
-    ctx.format() != BinaryFormat::Pe
+    !ctx.format().is_pe()
 }
 
 #[inline]
-fn align_up(off: usize, to: usize) -> usize {
-    let rem = off % to;
-    if rem == 0 { off } else { off + (to - rem) }
+fn align_up(off: usize, to: usize) -> Option<usize> {
+    if to == 0 {
+        return Some(off);
+    }
+    let rem = off.checked_rem(to)?;
+    if rem == 0 {
+        Some(off)
+    } else {
+        let pad = to.checked_sub(rem)?;
+        off.checked_add(pad)
+    }
 }
 
 fn is_plausible_name(name: &[u8]) -> bool {

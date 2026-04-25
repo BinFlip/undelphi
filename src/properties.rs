@@ -53,14 +53,15 @@
 //! and Name offset may be slightly off for non-trivial properties. A
 //! flavor-specific FPC decoder is reserved for a future iteration.
 
-use core::str;
+use std::str;
 
 use crate::{
     formats::BinaryContext,
     limits::{MAX_IDENTIFIER_BYTES, MAX_PROPERTIES_PER_CLASS},
-    rtti::tkclass_from_vmt,
+    rtti::TkClassInfo,
     util::{read_ptr, read_short_string_at_file, read_u16, read_u32},
     vmt::{Vmt, VmtFlavor},
+    vtable::VirtualMethodEntry,
 };
 
 /// How the compiler dispatches a getter / setter / stored access.
@@ -80,12 +81,45 @@ pub enum AccessKind {
 }
 
 /// Dispatch descriptor for a getter / setter / stored access.
+///
+/// `value` is interpreted by `kind`:
+///
+/// - [`AccessKind::Static`] — `value` is an absolute code VA. Subtract the
+///   image base for an RVA.
+/// - [`AccessKind::Field`] — `value` is the instance-relative byte offset
+///   of the backing field.
+/// - [`AccessKind::Virtual`] — `value` is a **VMT slot index**, *not* a
+///   VA. Resolve against the class's virtual-method table to get a code
+///   VA. [`Access::resolve`] does this for you.
+/// - [`AccessKind::Const`] — `value` is a constant (FPC-only).
+/// - [`AccessKind::None`] — no handler.
 #[derive(Debug, Clone, Copy)]
 pub struct Access {
     /// How to interpret `value`.
     pub kind: AccessKind,
-    /// Kind-dependent value: field offset, VMT index, or code VA.
+    /// Kind-dependent value: field offset, VMT slot index, code VA, or
+    /// constant. See the type-level docs for the per-kind meaning.
     pub value: u64,
+}
+
+/// Result of resolving an [`Access`] against a class's virtual-method table.
+///
+/// Returned by [`Access::resolve`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessTarget {
+    /// Absolute code VA — for [`AccessKind::Static`] and successfully
+    /// resolved [`AccessKind::Virtual`] entries.
+    CodeVa(u64),
+    /// Instance-relative field offset — for [`AccessKind::Field`].
+    FieldOffset(u32),
+    /// FPC constant value — for [`AccessKind::Const`].
+    Constant(u64),
+    /// Virtual slot whose VMT lookup didn't land on a code pointer.
+    /// Returned only when resolution fails — the caller can still attempt
+    /// their own lookup.
+    UnresolvedSlot(u16),
+    /// No handler ([`AccessKind::None`]).
+    Missing,
 }
 
 impl Access {
@@ -98,9 +132,9 @@ impl Access {
         // "field offset" and `$FE..` for "virtual dispatch" on 64-bit (and
         // similar on 32-bit, where the high byte of a 32-bit pointer
         // carries the same discriminator bits).
-        let shift = (ptr_size - 1) * 8;
-        let top = (raw >> shift) as u8;
-        let mask = ptr_size * 8;
+        let shift = ptr_size.saturating_sub(1).saturating_mul(8);
+        let top = (raw.wrapping_shr(shift as u32)) as u8;
+        let mask = ptr_size.saturating_mul(8);
         let low_mask = if mask == 64 {
             0x00FF_FFFF_FFFF_FFFFu64
         } else {
@@ -156,6 +190,33 @@ impl Access {
             _ => unreachable!(),
         }
     }
+
+    /// Resolve this access against a class's virtual-method table, hiding
+    /// the slot-index lookup the consumer would otherwise do by hand.
+    ///
+    /// Pass `virtual_methods` from
+    /// [`crate::DelphiBinary::virtual_methods`]. For batch resolution,
+    /// callers can index the slice once into a `HashMap<slot, code_va>`
+    /// instead of calling this repeatedly.
+    pub fn resolve(&self, virtual_methods: &[VirtualMethodEntry]) -> AccessTarget {
+        match self.kind {
+            AccessKind::None => AccessTarget::Missing,
+            AccessKind::Static => AccessTarget::CodeVa(self.value),
+            AccessKind::Field => AccessTarget::FieldOffset((self.value & 0xFFFF_FFFF) as u32),
+            AccessKind::Const => AccessTarget::Constant(self.value),
+            AccessKind::Virtual => {
+                let slot = self.value as u16;
+                match virtual_methods
+                    .iter()
+                    .find(|v| v.slot as u16 == slot)
+                    .map(|v| v.code_va)
+                {
+                    Some(va) => AccessTarget::CodeVa(va),
+                    None => AccessTarget::UnresolvedSlot(slot),
+                }
+            }
+        }
+    }
 }
 
 /// One published property of a class.
@@ -177,31 +238,50 @@ pub struct Property<'a> {
     pub default: i32,
     /// Name-index hint for fast property lookup.
     pub name_index: i16,
-    /// Property name; borrows from the input buffer.
-    pub name: &'a [u8],
+    pub(crate) name: &'a [u8],
     /// Virtual address the `PropType` PPTypeInfo indirection holds.
     pub prop_type_ref: u64,
 }
 
 impl<'a> Property<'a> {
-    /// Name as `&str`.
-    pub fn name_str(&self) -> &'a str {
+    /// Property name as `&str`, lossily decoded. Pascal identifiers are
+    /// ASCII in practice; non-UTF-8 bytes fall back to `"<non-ascii>"`.
+    #[inline]
+    pub fn name(&self) -> &'a str {
         str::from_utf8(self.name).unwrap_or("<non-ascii>")
+    }
+
+    /// Raw property name bytes (borrows from the input buffer).
+    #[inline]
+    pub fn name_bytes(&self) -> &'a [u8] {
+        self.name
     }
 }
 
-/// Decode every published property of `vmt`. Walks the class's tkClass
-/// TypeData up to and including `UnitName`, then reads the `TPropData`
-/// block that follows. Returns an empty vector if no RTTI is attached.
-pub fn iter_properties<'a>(ctx: &BinaryContext<'a>, vmt: &Vmt<'a>) -> Vec<Property<'a>> {
-    match vmt.flavor {
-        VmtFlavor::Delphi => iter_delphi(ctx, vmt).unwrap_or_default(),
-        // FPC's `TPropInfo` adds `PropProcs:Byte`, `IsStatic:Boolean`,
-        // `PropParams:ptr` before the Name ShortString, and FPC 3.0.x /
-        // 3.3+ additionally prefix a `AttributeTable:ptr`. We try layouts
-        // in order and accept the first one that yields a plausible
-        // identifier for every entry.
-        VmtFlavor::Fpc => iter_fpc_tkclass(ctx, vmt),
+impl<'a> Property<'a> {
+    /// Decode every published property declared on `vmt`.
+    ///
+    /// Walks the class's `tkClass` TypeData up to and including
+    /// `UnitName`, then reads the `TPropData` block that follows.
+    /// Returns an empty vector if no RTTI is attached or the table is
+    /// malformed.
+    pub fn iter(ctx: &BinaryContext<'a>, vmt: &Vmt<'a>) -> Vec<Self> {
+        match vmt.flavor {
+            VmtFlavor::Delphi => iter_delphi(ctx, vmt).unwrap_or_else(|| {
+                crate::__undelphi_trace_warn!(
+                    vmt_va = vmt.va,
+                    type_info = vmt.type_info,
+                    "Property::iter: TPropData walk bailed out"
+                );
+                Vec::new()
+            }),
+            // FPC's `TPropInfo` adds `PropProcs:Byte`, `IsStatic:Boolean`,
+            // `PropParams:ptr` before the Name ShortString, and FPC 3.0.x /
+            // 3.3+ additionally prefix a `AttributeTable:ptr`. We try
+            // layouts in order and accept the first one that yields a
+            // plausible identifier for every entry.
+            VmtFlavor::Fpc => iter_fpc_tkclass(ctx, vmt),
+        }
     }
 }
 
@@ -216,7 +296,7 @@ pub fn iter_properties<'a>(ctx: &BinaryContext<'a>, vmt: &Vmt<'a>) -> Vec<Proper
 /// `Name` at `4*ptr + 11` bytes from the record start. This holds on all
 /// three FPC builds we test.
 fn iter_fpc_tkclass<'a>(ctx: &BinaryContext<'a>, vmt: &Vmt<'a>) -> Vec<Property<'a>> {
-    let Some(info) = tkclass_from_vmt(ctx, vmt) else {
+    let Some(info) = TkClassInfo::from_vmt(ctx, vmt) else {
         return Vec::new();
     };
     let data = ctx.data();
@@ -227,40 +307,73 @@ fn iter_fpc_tkclass<'a>(ctx: &BinaryContext<'a>, vmt: &Vmt<'a>) -> Vec<Property<
     if count > MAX_PROPERTIES_PER_CLASS {
         return Vec::new();
     }
-    cursor += 2;
+    let Some(start) = cursor.checked_add(2) else {
+        return Vec::new();
+    };
+    cursor = start;
 
     let psize = vmt.pointer_size as usize;
-    let fixed = 4 * psize + 11; // ptr×4 + Index(4) + Default(4) + NameIndex(2) + PropProcs(1)
+    // ptr×4 + Index(4) + Default(4) + NameIndex(2) + PropProcs(1)
+    let Some(fixed) = psize.checked_mul(4).and_then(|n| n.checked_add(11)) else {
+        return Vec::new();
+    };
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
         let Some(prop_type_ref) = read_ptr(data, cursor, psize) else {
             break;
         };
-        let Some(get_raw) = read_ptr(data, cursor + psize, psize) else {
+        let Some(get_off) = cursor.checked_add(psize) else {
             break;
         };
-        let Some(set_raw) = read_ptr(data, cursor + 2 * psize, psize) else {
+        let Some(set_off) = get_off.checked_add(psize) else {
             break;
         };
-        let Some(stored_raw) = read_ptr(data, cursor + 3 * psize, psize) else {
+        let Some(stored_off) = set_off.checked_add(psize) else {
             break;
         };
-        let Some(index) = read_u32(data, cursor + 4 * psize).map(|u| u as i32) else {
+        let Some(get_raw) = read_ptr(data, get_off, psize) else {
             break;
         };
-        let Some(default) = read_u32(data, cursor + 4 * psize + 4).map(|u| u as i32) else {
+        let Some(set_raw) = read_ptr(data, set_off, psize) else {
             break;
         };
-        let Some(name_index) = read_u16(data, cursor + 4 * psize + 8).map(|u| u as i16) else {
+        let Some(stored_raw) = read_ptr(data, stored_off, psize) else {
+            break;
+        };
+        let Some(index_off) = stored_off.checked_add(psize) else {
+            break;
+        };
+        let Some(default_off) = index_off.checked_add(4) else {
+            break;
+        };
+        let Some(name_index_off) = default_off.checked_add(4) else {
+            break;
+        };
+        let Some(prop_procs_off) = name_index_off.checked_add(2) else {
+            break;
+        };
+        let Some(name_off) = cursor.checked_add(fixed) else {
+            break;
+        };
+        let Some(index) = read_u32(data, index_off).map(|u| u as i32) else {
+            break;
+        };
+        let Some(default) = read_u32(data, default_off).map(|u| u as i32) else {
+            break;
+        };
+        let Some(name_index) = read_u16(data, name_index_off).map(|u| u as i16) else {
             break;
         };
         // PropProcs at +10. The IsStatic / PropParams / AttributeTable
         // fields documented in `typinfo.pp` aren't part of the inline
         // record in the FPC versions we've sampled — they live in a
         // separate structure (or have been deferred to FPC 3.3+ layouts
-        // we don't yet target).
-        let prop_procs = *data.get(cursor + 4 * psize + 10).unwrap_or(&0);
-        let Some(name) = read_short_string_at_file(data, cursor + fixed) else {
+        // we don't yet target). A truncated record here means the table
+        // is malformed; surface it as a stop rather than guessing 0.
+        let Some(&prop_procs) = data.get(prop_procs_off) else {
+            break;
+        };
+        let Some(name) = read_short_string_at_file(data, name_off) else {
             break;
         };
         if name.is_empty()
@@ -272,11 +385,16 @@ fn iter_fpc_tkclass<'a>(ctx: &BinaryContext<'a>, vmt: &Vmt<'a>) -> Vec<Property<
             // structure. Stop gracefully instead of reporting None.
             break;
         }
-        let record_size = fixed + 1 + name.len();
+        let Some(record_size) = fixed.checked_add(1).and_then(|n| n.checked_add(name.len())) else {
+            break;
+        };
 
-        let va = range_to_va(ctx, cursor);
+        // Property::va is documented to be 0 when the file offset can't
+        // be translated back to a VA — that happens for synthetic
+        // sections we don't track, not for malformed input.
+        let va = range_to_va(ctx, cursor).unwrap_or(0);
         out.push(Property {
-            va: va.unwrap_or(0),
+            va,
             get: Access::from_fpc(get_raw, prop_procs, 0),
             set: Access::from_fpc(set_raw, prop_procs, 2),
             stored: Access::from_fpc(stored_raw, prop_procs, 4),
@@ -286,13 +404,16 @@ fn iter_fpc_tkclass<'a>(ctx: &BinaryContext<'a>, vmt: &Vmt<'a>) -> Vec<Property<
             name,
             prop_type_ref,
         });
-        cursor += record_size;
+        let Some(next) = cursor.checked_add(record_size) else {
+            break;
+        };
+        cursor = next;
     }
     out
 }
 
 fn iter_delphi<'a>(ctx: &BinaryContext<'a>, vmt: &Vmt<'a>) -> Option<Vec<Property<'a>>> {
-    let info = tkclass_from_vmt(ctx, vmt)?;
+    let info = TkClassInfo::from_vmt(ctx, vmt)?;
     let data = ctx.data();
     let mut cursor = info.prop_data_file_offset;
     // TPropData header: u16 PropCount, then the variable-size array.
@@ -300,33 +421,33 @@ fn iter_delphi<'a>(ctx: &BinaryContext<'a>, vmt: &Vmt<'a>) -> Option<Vec<Propert
     if count > MAX_PROPERTIES_PER_CLASS {
         return None;
     }
-    cursor += 2;
+    cursor = cursor.checked_add(2)?;
 
     let psize = vmt.pointer_size as usize;
-    let fixed = 4 * psize + 10; // bytes before the Name ShortString
+    // bytes before the Name ShortString: ptr×4 + Index(4) + Default(4) + NameIndex(2)
+    let fixed = psize.checked_mul(4)?.checked_add(10)?;
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
         // Header region: 4 pointers + 4 + 4 + 2 = fixed bytes.
         let prop_type_ref = read_ptr(data, cursor, psize)?;
-        let get_raw = read_ptr(data, cursor + psize, psize)?;
-        let set_raw = read_ptr(data, cursor + 2 * psize, psize)?;
-        let stored_raw = read_ptr(data, cursor + 3 * psize, psize)?;
-        let index = i32::from_le_bytes(
-            data.get(cursor + 4 * psize..cursor + 4 * psize + 4)?
-                .try_into()
-                .ok()?,
-        );
-        let default = i32::from_le_bytes(
-            data.get(cursor + 4 * psize + 4..cursor + 4 * psize + 8)?
-                .try_into()
-                .ok()?,
-        );
-        let name_index = i16::from_le_bytes(
-            data.get(cursor + 4 * psize + 8..cursor + 4 * psize + 10)?
-                .try_into()
-                .ok()?,
-        );
-        let name = read_short_string_at_file(data, cursor + fixed)?;
+        let get_off = cursor.checked_add(psize)?;
+        let set_off = get_off.checked_add(psize)?;
+        let stored_off = set_off.checked_add(psize)?;
+        let index_off = stored_off.checked_add(psize)?;
+        let default_off = index_off.checked_add(4)?;
+        let name_index_off = default_off.checked_add(4)?;
+        let name_off = cursor.checked_add(fixed)?;
+        let get_raw = read_ptr(data, get_off, psize)?;
+        let set_raw = read_ptr(data, set_off, psize)?;
+        let stored_raw = read_ptr(data, stored_off, psize)?;
+        let index_end = index_off.checked_add(4)?;
+        let default_end = default_off.checked_add(4)?;
+        let name_index_end = name_index_off.checked_add(2)?;
+        let index = i32::from_le_bytes(data.get(index_off..index_end)?.try_into().ok()?);
+        let default = i32::from_le_bytes(data.get(default_off..default_end)?.try_into().ok()?);
+        let name_index =
+            i16::from_le_bytes(data.get(name_index_off..name_index_end)?.try_into().ok()?);
+        let name = read_short_string_at_file(data, name_off)?;
         // Plausibility: property names are identifiers.
         if name.is_empty()
             || name.len() > MAX_IDENTIFIER_BYTES
@@ -334,11 +455,14 @@ fn iter_delphi<'a>(ctx: &BinaryContext<'a>, vmt: &Vmt<'a>) -> Option<Vec<Propert
         {
             return None;
         }
-        let record_size = fixed + 1 + name.len();
+        let record_size = fixed.checked_add(1)?.checked_add(name.len())?;
 
-        let va = range_to_va(ctx, cursor);
+        // Property::va is documented to be 0 when the file offset can't
+        // be translated back to a VA — that happens for synthetic
+        // sections we don't track, not for malformed input.
+        let va = range_to_va(ctx, cursor).unwrap_or(0);
         out.push(Property {
-            va: va.unwrap_or(0),
+            va,
             get: Access::from_ptr(get_raw, psize),
             set: Access::from_ptr(set_raw, psize),
             stored: Access::from_ptr(stored_raw, psize),
@@ -348,7 +472,7 @@ fn iter_delphi<'a>(ctx: &BinaryContext<'a>, vmt: &Vmt<'a>) -> Option<Vec<Propert
             name,
             prop_type_ref,
         });
-        cursor += record_size;
+        cursor = cursor.checked_add(record_size)?;
     }
     Some(out)
 }
@@ -362,8 +486,10 @@ fn is_prop_name_byte(b: &u8) -> bool {
 /// safely ignore a returned `0`.
 fn range_to_va(ctx: &BinaryContext<'_>, file_off: usize) -> Option<u64> {
     for range in ctx.sections().scan_targets.iter() {
-        if file_off >= range.offset && file_off < range.offset + range.size {
-            return Some(range.va + (file_off - range.offset) as u64);
+        let range_end = range.offset.checked_add(range.size)?;
+        if file_off >= range.offset && file_off < range_end {
+            let rel = file_off.checked_sub(range.offset)?;
+            return range.va.checked_add(rel as u64);
         }
     }
     None

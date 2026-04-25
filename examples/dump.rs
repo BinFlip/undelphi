@@ -12,14 +12,11 @@ use undelphi::{
     blobs::{EmbeddedBlob, catalog as catalog_blobs},
     classes::Class,
     dfm::{DfmObject, DfmProperty, DfmValue},
-    extrtti::decode_attribute_block,
+    extrtti::AttributeEntry,
     fields::FieldTypeRef,
     layout::{LayoutKind, reconstruct},
     render::{render_enum_ordinal, render_set_mask_with_enum, render_type_label, render_value},
-    rtti::{
-        TkClassInfo, TypeDetail, TypeKind, decode_tkenum, decode_type_detail,
-        decode_type_header_from_pptr, deref_pptypeinfo,
-    },
+    rtti::{EnumInfo, TkClassInfo, TypeDetail, TypeHeader, TypeKind},
     vmt::VmtFlavor,
     xref::{
         dfm_class_instantiations, event_bindings, events_by_method, external_class_refs,
@@ -40,9 +37,12 @@ fn main() {
             process::exit(1);
         }
     };
-    let Some(bin) = DelphiBinary::parse(&data) else {
-        eprintln!("not a recognised Delphi/C++Builder/FPC binary");
-        process::exit(1);
+    let bin = match DelphiBinary::parse(&data) {
+        Ok(bin) => bin,
+        Err(e) => {
+            eprintln!("not a recognised Delphi/C++Builder/FPC binary: {e}");
+            process::exit(1);
+        }
     };
 
     print_overview(&bin, &args[1], data.len());
@@ -203,12 +203,7 @@ fn print_one_class<'a>(bin: &DelphiBinary<'a>, class: &Class<'a>, flavor: VmtFla
                     None => format!("{:?}", f.type_ref),
                 },
             };
-            println!(
-                "      +0x{:06x}  {:<36} : {}",
-                f.offset,
-                f.name_str(),
-                ty_label
-            );
+            println!("      +0x{:06x}  {:<36} : {}", f.offset, f.name(), ty_label);
         }
     }
 
@@ -217,7 +212,7 @@ fn print_one_class<'a>(bin: &DelphiBinary<'a>, class: &Class<'a>, flavor: VmtFla
     if !methods.is_empty() {
         println!("    published methods ({}):", methods.len());
         for m in &methods {
-            println!("      0x{:08x}  {}", m.code_va, m.name_str());
+            println!("      0x{:08x}  {}", m.code_va, m.name());
         }
     }
 
@@ -226,10 +221,7 @@ fn print_one_class<'a>(bin: &DelphiBinary<'a>, class: &Class<'a>, flavor: VmtFla
     if !ifaces.is_empty() {
         println!("    interfaces ({}):", ifaces.len());
         for i in &ifaces {
-            let iid_str = i
-                .iid_str
-                .map(|b| String::from_utf8_lossy(b).into_owned())
-                .filter(|s| !s.is_empty());
+            let iid_str = i.iid_str().filter(|s| !s.is_empty());
             let name_part = match iid_str {
                 Some(s) => format!(" (iid_str={})", s),
                 None => String::new(),
@@ -269,7 +261,7 @@ fn print_one_class<'a>(bin: &DelphiBinary<'a>, class: &Class<'a>, flavor: VmtFla
         for (i, f) in init.managed_fields.iter().enumerate() {
             let ty = f
                 .field_type
-                .map(|h| format!("{} [{:?}]", h.name_str(), h.kind))
+                .map(|h| format!("{} [{:?}]", h.name(), h.kind))
                 .unwrap_or_else(|| format!("0x{:x}", f.type_ref));
             println!("      [{}] +0x{:x}  {}", i, f.offset, ty);
         }
@@ -290,23 +282,19 @@ fn print_one_class<'a>(bin: &DelphiBinary<'a>, class: &Class<'a>, flavor: VmtFla
         println!("    extended-RTTI properties ({}):", ext.len());
         let psize = class.pointer_size() as usize;
         for e in &ext {
-            let mut line = format!("      [{:?}] {:<32}", e.visibility, e.info.name_str());
+            let mut line = format!("      [{:?}] {:<32}", e.visibility, e.info.name());
             if !e.attributes_raw.is_empty() {
-                let (attrs, _) = decode_attribute_block(e.attributes_raw, psize);
+                let (attrs, _) = AttributeEntry::decode_block(e.attributes_raw, psize);
                 if !attrs.is_empty() {
                     let _ = write!(line, "  attrs=[");
                     for (i, ae) in attrs.iter().enumerate() {
                         if i > 0 {
                             let _ = write!(line, ", ");
                         }
-                        let ty = decode_type_header_from_pptr(
-                            bin.ctx(),
-                            ae.attr_type_ref,
-                            psize,
-                            bin.flavor(),
-                        )
-                        .map(|h| h.name_str().to_owned())
-                        .unwrap_or_else(|| format!("0x{:x}", ae.attr_type_ref));
+                        let ty =
+                            TypeHeader::from_pptr(bin.ctx(), ae.attr_type_ref, psize, bin.flavor())
+                                .map(|h| h.name().to_owned())
+                                .unwrap_or_else(|| format!("0x{:x}", ae.attr_type_ref));
                         let arg = if let Some(s) = ae.arg_as_string() {
                             format!("({:?})", String::from_utf8_lossy(s))
                         } else if ae.arg_data.len() == 4 {
@@ -382,7 +370,7 @@ fn print_one_class<'a>(bin: &DelphiBinary<'a>, class: &Class<'a>, flavor: VmtFla
             };
             println!(
                 "      {:<32} : {:<50}  get={:?}:0x{:x}  set={:?}:0x{:x}  index={}  default={}",
-                p.name_str(),
+                p.name(),
                 ty_label,
                 p.get.kind,
                 p.get.value,
@@ -401,14 +389,11 @@ fn print_one_class<'a>(bin: &DelphiBinary<'a>, class: &Class<'a>, flavor: VmtFla
 /// one-liner of the type-specific payload.
 fn render_detail_inline(detail: &TypeDetail<'_>) -> String {
     let h = detail.header();
-    let base = format!("{} [{:?}]", h.name_str(), h.kind);
+    let base = format!("{} [{:?}]", h.name(), h.kind);
     match detail {
-        TypeDetail::Class(x) => format!(
-            "{} unit={} propcount={}",
-            base,
-            x.unit_name_str().unwrap_or("?"),
-            x.prop_count
-        ),
+        TypeDetail::Class(x) => {
+            format!("{} unit={} propcount={}", base, x.unit_name(), x.prop_count)
+        }
         TypeDetail::Enumeration(x) => {
             let names: Vec<_> = x
                 .values
@@ -422,43 +407,39 @@ fn render_detail_inline(detail: &TypeDetail<'_>) -> String {
         TypeDetail::Set(x) => {
             let elem = x
                 .element_type
-                .map(|h| h.name_str().to_string())
+                .map(|h| h.name().to_string())
                 .unwrap_or_else(|| "?".into());
             format!("{} of={}", base, elem)
         }
         TypeDetail::ClassRef(x) => {
             let inst = x
                 .instance_type
-                .map(|h| h.name_str().to_string())
+                .map(|h| h.name().to_string())
                 .unwrap_or_else(|| "?".into());
             format!("{} of={}", base, inst)
         }
         TypeDetail::DynArray(x) => {
             let elem = x
                 .element_type
-                .map(|h| h.name_str().to_string())
+                .map(|h| h.name().to_string())
                 .unwrap_or_else(|| "?".into());
             format!(
                 "{} elem={} elemsz={} unit={}",
                 base,
                 elem,
                 x.elem_size,
-                x.unit_name
-                    .map(|u| String::from_utf8_lossy(u).into_owned())
-                    .unwrap_or_else(|| "?".into())
+                x.unit_name().unwrap_or("?")
             )
         }
         TypeDetail::Interface(x) => format!(
             "{} parent={} guid={} flags=0x{:02x} unit={}",
             base,
             x.parent_type
-                .map(|h| h.name_str().to_string())
+                .map(|h| h.name().to_string())
                 .unwrap_or_else(|| "?".into()),
             x.guid.to_string_delphi(),
             x.flags,
-            x.unit_name
-                .map(|u| String::from_utf8_lossy(u).into_owned())
-                .unwrap_or_else(|| "?".into())
+            x.unit_name().unwrap_or("?")
         ),
         TypeDetail::Record(x) => format!(
             "{} size={} managed_fields={}",
@@ -470,7 +451,7 @@ fn render_detail_inline(detail: &TypeDetail<'_>) -> String {
             let params: Vec<_> = x
                 .params
                 .iter()
-                .map(|p| format!("{}:{}", p.name_str(), p.type_name_str()))
+                .map(|p| format!("{}:{}", p.name(), p.type_name()))
                 .collect();
             let ret = x
                 .result_type
@@ -487,7 +468,7 @@ fn render_detail_inline(detail: &TypeDetail<'_>) -> String {
 fn print_tkclass_detail(tk: &TkClassInfo<'_>) {
     println!(
         "    RTTI tkClass: unit={} prop_count={} parent_info_va=0x{:x} class_type_va=0x{:x}",
-        tk.unit_name_str().unwrap_or("?"),
+        tk.unit_name(),
         tk.prop_count,
         tk.parent_info_va,
         tk.class_type_va
@@ -501,8 +482,8 @@ fn print_forms(bin: &DelphiBinary<'_>) {
         println!(
             "\n  resource {} → {}:{}  ({} components)",
             name,
-            obj.class_name_str(),
-            obj.object_name_str(),
+            obj.class_name(),
+            obj.object_name(),
             obj.component_count()
         );
         print_dfm_object(bin, obj, 1);
@@ -514,8 +495,8 @@ fn print_dfm_object(bin: &DelphiBinary<'_>, obj: &DfmObject<'_>, depth: usize) {
     println!(
         "{}<object {}:{}>{}",
         indent,
-        obj.class_name_str(),
-        obj.object_name_str(),
+        obj.class_name(),
+        obj.object_name(),
         if obj.properties.is_empty() && obj.children.is_empty() {
             " (empty)"
         } else {
@@ -526,10 +507,10 @@ fn print_dfm_object(bin: &DelphiBinary<'_>, obj: &DfmObject<'_>, depth: usize) {
     // look up each property's declared type for symbolic rendering, and
     // cross-link event handlers to the method-table entry that carries
     // the code VA.
-    let cls = bin.classes().find_by_name(obj.class_name_str());
+    let cls = bin.classes().find_by_name(obj.class_name());
     for p in &obj.properties {
         let rendered = render_property_value(bin, cls, p);
-        let name = p.name_str();
+        let name = p.name();
         let handler_link = if name.starts_with("On")
             && let DfmValue::String(method) = &p.value
             && let Ok(method_name) = str::from_utf8(method)
@@ -567,7 +548,7 @@ fn render_property_value<'a>(
         let mut walker: Option<&Class<'_>> = Some(cls);
         while let Some(c) = walker {
             for rp in bin.properties(c) {
-                if rp.name_str().eq_ignore_ascii_case(prop.name_str())
+                if rp.name().eq_ignore_ascii_case(prop.name())
                     && let Some(detail) = bin.property_type_detail(c, &rp)
                 {
                     return render_value_with_detail(bin, &prop.value, &detail);
@@ -592,7 +573,7 @@ fn render_value_with_detail(
                 return format!("0x{:x}", mask);
             };
             // Follow the element header to decode the enum.
-            if let Some(enum_info) = decode_tkenum(bin.ctx(), elem_header.va, bin.flavor()) {
+            if let Some(enum_info) = EnumInfo::from_va(bin.ctx(), elem_header.va, bin.flavor()) {
                 render_set_mask_with_enum(*mask as u32, &enum_info)
             } else {
                 format!("set 0x{:x}", mask)
@@ -611,8 +592,7 @@ fn print_enum_catalog(bin: &DelphiBinary<'_>) {
             if let Some(th) = bin.property_type(class, &p)
                 && matches!(th.kind, TypeKind::Enumeration)
             {
-                seen.entry(th.va)
-                    .or_insert_with(|| th.name_str().to_owned());
+                seen.entry(th.va).or_insert_with(|| th.name().to_owned());
             }
         }
     }
@@ -621,7 +601,7 @@ fn print_enum_catalog(bin: &DelphiBinary<'_>) {
     }
     section_header(&format!("enumeration types — {} distinct", seen.len()));
     for (va, name) in &seen {
-        let Some(info) = decode_tkenum(ctx, *va, flavor) else {
+        let Some(info) = EnumInfo::from_va(ctx, *va, flavor) else {
             continue;
         };
         let names: Vec<_> = info
@@ -635,9 +615,7 @@ fn print_enum_catalog(bin: &DelphiBinary<'_>) {
             info.min,
             info.max,
             info.ord,
-            info.unit_name
-                .map(|u| String::from_utf8_lossy(u).into_owned())
-                .unwrap_or_else(|| "?".into()),
+            info.unit_name().unwrap_or("?"),
             names.join(", ")
         );
     }
@@ -649,8 +627,9 @@ fn print_enum_catalog(bin: &DelphiBinary<'_>) {
     for class in bin.classes().iter() {
         for f in bin.fields(class) {
             if let FieldTypeRef::TypeInfoPtr(pptr) = f.type_ref
-                && let Some(ti_va) = deref_pptypeinfo(ctx, pptr, class.pointer_size() as usize)
-                && let Some(detail) = decode_type_detail(ctx, ti_va, flavor)
+                && let Some(ti_va) =
+                    TypeHeader::deref_pptypeinfo(ctx, pptr, class.pointer_size() as usize)
+                && let Some(detail) = TypeDetail::from_va(ctx, ti_va, flavor)
                 && matches!(
                     detail,
                     TypeDetail::Record(_)
@@ -674,7 +653,7 @@ fn print_enum_catalog(bin: &DelphiBinary<'_>) {
                 for (i, f) in r.managed_fields.iter().enumerate() {
                     let ty = f
                         .field_type
-                        .map(|h| h.name_str().to_string())
+                        .map(|h| h.name().to_string())
                         .unwrap_or_else(|| format!("0x{:x}", f.type_ref));
                     println!("      [{}] +0x{:x}  {}", i, f.offset, ty);
                 }
@@ -818,7 +797,7 @@ fn print_blob_catalog(bin: &DelphiBinary<'_>) {
     }
     section_header(&format!("DFM embedded binaries — {} blobs", blobs.len()));
     // Group by kind.
-    let mut by_kind: BTreeMap<&'static str, Vec<&EmbeddedBlob<'_>>> = Default::default();
+    let mut by_kind: BTreeMap<&'static str, Vec<&EmbeddedBlob<'_, '_>>> = Default::default();
     for b in &blobs {
         by_kind.entry(b.kind.label()).or_default().push(b);
     }
@@ -835,7 +814,7 @@ fn print_blob_catalog(bin: &DelphiBinary<'_>) {
                 "    [{}B]  {}.{}  ({})",
                 b.data.len(),
                 b.path,
-                b.property_name,
+                b.property_name(),
                 b.form_resource
             );
         }

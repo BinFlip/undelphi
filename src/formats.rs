@@ -17,26 +17,90 @@
 //!
 //! See `RESEARCH.md` §9 (PE), §10 (Mach-O / ELF) for the format-level context.
 
-use core::fmt;
+use std::fmt;
 
 use goblin::{
     Object,
-    elf::{program_header::PT_LOAD, section_header::SHT_NOBITS},
-    mach::Mach,
-    pe::PE,
+    elf::{
+        header::{self as elf_header, EM_386, EM_AARCH64, EM_ARM, EM_X86_64},
+        program_header::PT_LOAD,
+        section_header::SHT_NOBITS,
+    },
+    mach::{Mach, cputype as mach_cpu},
+    pe::{
+        PE,
+        header::{COFF_MACHINE_ARM, COFF_MACHINE_ARM64, COFF_MACHINE_X86, COFF_MACHINE_X86_64},
+    },
 };
 
-/// Detected executable format.
+use crate::detection::{TargetArch, TargetOs};
+
+/// Detected executable format, including bitness when known.
+///
+/// Use the `is_*` helpers to write code that is robust to future variants:
+///
+/// ```
+/// use undelphi::formats::BinaryFormat;
+/// let f = BinaryFormat::Pe64;
+/// assert!(f.is_pe() && f.is_64bit());
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BinaryFormat {
-    /// ELF — Linux / FreeBSD / Android.
-    Elf,
-    /// Mach-O — macOS / iOS. Both 32- and 64-bit variants covered.
-    MachO,
-    /// PE (Portable Executable) — Windows. Both `PE32` and `PE32+` covered.
-    Pe,
-    /// Unrecognized container. Magic-byte scanning can still find some markers.
+    /// 32-bit ELF — Linux / FreeBSD / Android (i386, ARM).
+    Elf32,
+    /// 64-bit ELF — Linux / FreeBSD / Android (x86_64, AArch64).
+    Elf64,
+    /// 32-bit Mach-O — older macOS / iOS.
+    MachO32,
+    /// 64-bit Mach-O — modern macOS / iOS.
+    MachO64,
+    /// 32-bit PE (`PE32`).
+    Pe32,
+    /// 64-bit PE (`PE32+`).
+    Pe64,
+    /// A recognised container magic was present but bitness could not be
+    /// determined from the magic alone (typically the goblin parse failed
+    /// before headers could be walked). Heuristic scans still ran.
     Unknown,
+}
+
+impl BinaryFormat {
+    /// `true` for any PE flavour ([`Pe32`](Self::Pe32) or
+    /// [`Pe64`](Self::Pe64)).
+    #[inline]
+    pub fn is_pe(self) -> bool {
+        matches!(self, BinaryFormat::Pe32 | BinaryFormat::Pe64)
+    }
+
+    /// `true` for any ELF flavour.
+    #[inline]
+    pub fn is_elf(self) -> bool {
+        matches!(self, BinaryFormat::Elf32 | BinaryFormat::Elf64)
+    }
+
+    /// `true` for any Mach-O flavour.
+    #[inline]
+    pub fn is_macho(self) -> bool {
+        matches!(self, BinaryFormat::MachO32 | BinaryFormat::MachO64)
+    }
+
+    /// Pointer width in bytes (`4`, `8`, or `None` when bitness wasn't
+    /// determined from the container).
+    #[inline]
+    pub fn bitness(self) -> Option<u8> {
+        match self {
+            BinaryFormat::Elf32 | BinaryFormat::MachO32 | BinaryFormat::Pe32 => Some(4),
+            BinaryFormat::Elf64 | BinaryFormat::MachO64 | BinaryFormat::Pe64 => Some(8),
+            BinaryFormat::Unknown => None,
+        }
+    }
+
+    /// `true` when bitness is known and is 64-bit.
+    #[inline]
+    pub fn is_64bit(self) -> bool {
+        self.bitness() == Some(8)
+    }
 }
 
 /// A contiguous byte range within the binary, with its virtual address.
@@ -93,6 +157,20 @@ pub struct BinaryContext<'a> {
     /// Cached pointer width inferred from the parsed container, populated in
     /// [`BinaryContext::new`] so accessors don't re-parse the binary.
     pointer_size: Option<usize>,
+    /// Whether goblin successfully parsed the container. `false` either
+    /// because the input lacks a recognised magic, or because the magic is
+    /// present but the headers walked off the end of the slice. Used by
+    /// [`crate::DelphiBinary::parse`] to distinguish "not Delphi" from
+    /// "truncated container".
+    container_parsed: bool,
+    /// Target OS inferred from container metadata (PE → Windows, Mach-O →
+    /// Darwin, ELF → Linux/Android via `EI_OSABI`). `Unknown` when the
+    /// container couldn't be parsed.
+    target_os: TargetOs,
+    /// Target architecture inferred from container metadata (PE
+    /// `Machine`, ELF `e_machine`, Mach-O `cputype`). `Unknown` when the
+    /// container couldn't be parsed.
+    target_arch: TargetArch,
     /// The goblin-parsed PE, retained so downstream modules (e.g. resources)
     /// can use goblin's structural types instead of re-rolling their own.
     /// `None` for non-PE containers or unparseable PE input.
@@ -118,13 +196,52 @@ impl<'a> BinaryContext<'a> {
     /// Always succeeds — returns an empty context for garbage input so that
     /// heuristic scans can still run.
     pub fn new(data: &'a [u8]) -> Self {
-        let format = detect_format(data);
+        let mut format = detect_format(data);
         let mut sections = DelphiSections::default();
         let mut segments = Vec::new();
         let mut pe_holder: Option<PE<'a>> = None;
         let mut pointer_size: Option<usize> = None;
+        let mut container_parsed = false;
+        let mut target_os = TargetOs::Unknown;
+        let mut target_arch = TargetArch::Unknown;
 
         if let Ok(obj) = Object::parse(data) {
+            container_parsed = matches!(
+                obj,
+                Object::Elf(_) | Object::Mach(Mach::Binary(_)) | Object::PE(_)
+            );
+            // Refine format with the bitness goblin recovered, plus
+            // target-os and arch.
+            format = match &obj {
+                Object::Elf(e) => {
+                    target_os = elf_target_os(e.header.e_ident[elf_header::EI_OSABI]);
+                    target_arch = elf_target_arch(e.header.e_machine);
+                    if e.is_64 {
+                        BinaryFormat::Elf64
+                    } else {
+                        BinaryFormat::Elf32
+                    }
+                }
+                Object::Mach(Mach::Binary(m)) => {
+                    target_os = TargetOs::Darwin;
+                    target_arch = mach_target_arch(m.header.cputype());
+                    if m.is_64 {
+                        BinaryFormat::MachO64
+                    } else {
+                        BinaryFormat::MachO32
+                    }
+                }
+                Object::PE(p) => {
+                    target_os = TargetOs::Windows;
+                    target_arch = pe_target_arch(p.header.coff_header.machine);
+                    if p.is_64 {
+                        BinaryFormat::Pe64
+                    } else {
+                        BinaryFormat::Pe32
+                    }
+                }
+                _ => format,
+            };
             match obj {
                 Object::Elf(elf) => {
                     pointer_size = Some(if elf.is_64 { 8 } else { 4 });
@@ -212,7 +329,7 @@ impl<'a> BinaryContext<'a> {
                     // Copy out only what we need before moving `pe` into the
                     // holder at function end. Iteration here is read-only.
                     for section in &pe.sections {
-                        let va = image_base + section.virtual_address as u64;
+                        let va = image_base.saturating_add(section.virtual_address as u64);
                         let file_off = section.pointer_to_raw_data as u64;
                         let size = section.size_of_raw_data as u64;
                         if size > 0 {
@@ -266,8 +383,54 @@ impl<'a> BinaryContext<'a> {
             sections,
             segments,
             pointer_size,
+            container_parsed,
+            target_os,
+            target_arch,
             pe: pe_holder,
         }
+    }
+
+    /// Target OS inferred from container metadata (independent of the
+    /// compiler build-string). `TargetOs::Unknown` when the container
+    /// couldn't be parsed. Mach-O always reports `Darwin` — distinguishing
+    /// macOS from iOS requires a build-string match.
+    #[inline]
+    pub fn target_os(&self) -> TargetOs {
+        self.target_os
+    }
+
+    /// Target architecture inferred from container metadata.
+    /// `TargetArch::Unknown` when the container couldn't be parsed or the
+    /// machine code didn't map onto a tracked variant.
+    #[inline]
+    pub fn target_arch(&self) -> TargetArch {
+        self.target_arch
+    }
+
+    /// Whether `va` lies inside the binary's primary code section (PE
+    /// `.text` / `CODE`, ELF `.text`, Mach-O `__text`). Used by walkers
+    /// that need to validate function-pointer candidates without an
+    /// explicit count.
+    pub fn is_code_va(&self, va: u64) -> bool {
+        let Some(t) = self.sections.text else {
+            return false;
+        };
+        let Some(end) = t.va.checked_add(t.size as u64) else {
+            return false;
+        };
+        va >= t.va && va < end
+    }
+
+    /// Whether the underlying container (PE / ELF / Mach-O) parsed cleanly.
+    ///
+    /// `false` either because the input has no recognised container magic,
+    /// or because the magic is there but the headers are truncated /
+    /// malformed. `BinaryContext::new` is infallible — heuristic scans still
+    /// run on garbage input — so callers that want to discriminate "not
+    /// Delphi" from "broken executable" should consult this flag.
+    #[inline]
+    pub fn container_parsed(&self) -> bool {
+        self.container_parsed
     }
 
     /// The original byte buffer.
@@ -306,12 +469,13 @@ impl<'a> BinaryContext<'a> {
         let idx = self
             .segments
             .partition_point(|&(seg_va, _, _)| seg_va <= va);
-        if idx == 0 {
-            return None;
-        }
-        let (seg_va, file_off, size) = self.segments[idx - 1];
-        if va >= seg_va && va < seg_va + size {
-            usize::try_from(va - seg_va + file_off).ok()
+        let prev = idx.checked_sub(1)?;
+        let &(seg_va, file_off, size) = self.segments.get(prev)?;
+        let seg_end = seg_va.checked_add(size)?;
+        if va >= seg_va && va < seg_end {
+            let rel = va.checked_sub(seg_va)?;
+            let abs = rel.checked_add(file_off)?;
+            usize::try_from(abs).ok()
         } else {
             None
         }
@@ -350,21 +514,68 @@ impl<'a> BinaryContext<'a> {
     }
 }
 
-/// Cheap magic-byte check to classify a binary's container.
-pub fn detect_format(data: &[u8]) -> BinaryFormat {
-    if data.len() < 4 {
-        return BinaryFormat::Unknown;
+fn elf_target_os(ei_osabi: u8) -> TargetOs {
+    // ELF OSABI codes from the SysV ABI spec; only the ones we actually
+    // see on real Delphi/FPC ELF output are mapped explicitly. `0`
+    // (SYSV) is the Linux default, since Linux toolchains usually leave
+    // OSABI unset.
+    match ei_osabi {
+        elf_header::ELFOSABI_LINUX | elf_header::ELFOSABI_NONE => TargetOs::Linux,
+        _ => TargetOs::Linux,
     }
-    match data[..4] {
-        [0x7f, b'E', b'L', b'F'] => BinaryFormat::Elf,
-        // Mach-O 32/64-bit LE/BE, fat binaries.
-        [0xfe, 0xed, 0xfa, 0xce]
-        | [0xce, 0xfa, 0xed, 0xfe]
-        | [0xfe, 0xed, 0xfa, 0xcf]
-        | [0xcf, 0xfa, 0xed, 0xfe]
-        | [0xca, 0xfe, 0xba, 0xbe]
-        | [0xbe, 0xba, 0xfe, 0xca] => BinaryFormat::MachO,
-        [b'M', b'Z', _, _] => BinaryFormat::Pe,
+}
+
+fn elf_target_arch(e_machine: u16) -> TargetArch {
+    match e_machine {
+        EM_386 => TargetArch::X86,
+        EM_X86_64 => TargetArch::X86_64,
+        EM_ARM => TargetArch::Arm,
+        EM_AARCH64 => TargetArch::Aarch64,
+        _ => TargetArch::Unknown,
+    }
+}
+
+fn mach_target_arch(cputype: u32) -> TargetArch {
+    match cputype {
+        mach_cpu::CPU_TYPE_X86 => TargetArch::X86,
+        mach_cpu::CPU_TYPE_X86_64 => TargetArch::X86_64,
+        mach_cpu::CPU_TYPE_ARM => TargetArch::Arm,
+        mach_cpu::CPU_TYPE_ARM64 => TargetArch::Aarch64,
+        _ => TargetArch::Unknown,
+    }
+}
+
+fn pe_target_arch(machine: u16) -> TargetArch {
+    match machine {
+        COFF_MACHINE_X86 => TargetArch::X86,
+        COFF_MACHINE_X86_64 => TargetArch::X86_64,
+        COFF_MACHINE_ARM => TargetArch::Arm,
+        COFF_MACHINE_ARM64 => TargetArch::Aarch64,
+        _ => TargetArch::Unknown,
+    }
+}
+
+/// Cheap magic-byte check to classify a binary's container.
+///
+/// Bitness cannot always be determined from the magic alone (the ELF and
+/// PE magics are bitness-agnostic; only Mach-O encodes it in the magic).
+/// The result is refined to the precise variant in
+/// [`BinaryContext::new`] once goblin walks the headers; for the known
+/// magics where bitness isn't yet established, this returns the 32-bit
+/// variant as a placeholder.
+pub fn detect_format(data: &[u8]) -> BinaryFormat {
+    let Some(magic) = data.get(..4) else {
+        return BinaryFormat::Unknown;
+    };
+    match magic {
+        [0x7f, b'E', b'L', b'F'] => BinaryFormat::Elf32,
+        // Mach-O 32-bit LE/BE.
+        [0xfe, 0xed, 0xfa, 0xce] | [0xce, 0xfa, 0xed, 0xfe] => BinaryFormat::MachO32,
+        // Mach-O 64-bit LE/BE.
+        [0xfe, 0xed, 0xfa, 0xcf] | [0xcf, 0xfa, 0xed, 0xfe] => BinaryFormat::MachO64,
+        // Fat / universal binaries — bitness mixed; report 32 as placeholder.
+        [0xca, 0xfe, 0xba, 0xbe] | [0xbe, 0xba, 0xfe, 0xca] => BinaryFormat::MachO32,
+        [b'M', b'Z', _, _] => BinaryFormat::Pe32,
         _ => BinaryFormat::Unknown,
     }
 }
@@ -375,11 +586,23 @@ mod tests {
 
     #[test]
     fn detect_format_from_magics() {
-        assert_eq!(detect_format(b"\x7fELF...."), BinaryFormat::Elf);
-        assert_eq!(detect_format(b"MZ\x00\x00"), BinaryFormat::Pe);
-        assert_eq!(detect_format(b"\xcf\xfa\xed\xfe"), BinaryFormat::MachO);
+        assert_eq!(detect_format(b"\x7fELF...."), BinaryFormat::Elf32);
+        assert_eq!(detect_format(b"MZ\x00\x00"), BinaryFormat::Pe32);
+        assert_eq!(detect_format(b"\xcf\xfa\xed\xfe"), BinaryFormat::MachO64);
+        assert_eq!(detect_format(b"\xfe\xed\xfa\xce"), BinaryFormat::MachO32);
         assert_eq!(detect_format(b"ZZZZ"), BinaryFormat::Unknown);
         assert_eq!(detect_format(b""), BinaryFormat::Unknown);
+    }
+
+    #[test]
+    fn binary_format_helpers() {
+        assert!(BinaryFormat::Pe64.is_pe());
+        assert!(BinaryFormat::Pe64.is_64bit());
+        assert!(!BinaryFormat::Pe32.is_64bit());
+        assert!(BinaryFormat::Elf32.is_elf());
+        assert!(BinaryFormat::MachO64.is_macho());
+        assert_eq!(BinaryFormat::Pe32.bitness(), Some(4));
+        assert_eq!(BinaryFormat::Unknown.bitness(), None);
     }
 
     #[test]

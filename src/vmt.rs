@@ -71,8 +71,7 @@
 //! The class-name slice returned by [`Vmt::class_name`] is a direct slice
 //! of the caller's binary buffer; no string copy happens in the hot path.
 
-use core::str;
-use std::collections::HashSet;
+use std::{collections::HashSet, str};
 
 use crate::{
     formats::{BinaryContext, BinaryFormat, SectionRange},
@@ -128,16 +127,22 @@ pub struct Vmt<'a> {
     /// VA of the parent class's VMT base, or `0` for root classes.
     pub parent_vmt: u64,
 
-    /// Class-name short-string body; borrows from the input buffer.
-    pub class_name: &'a [u8],
+    pub(crate) class_name: &'a [u8],
 }
 
 impl<'a> Vmt<'a> {
-    /// Class name as `&str`, or `None` if not UTF-8. In practice Delphi /
-    /// FPC class names are always ASCII.
+    /// Class name as `&str`, lossily decoded. Pascal class names are ASCII
+    /// in practice; non-UTF-8 bytes fall back to `"<non-ascii>"`.
     #[inline]
-    pub fn class_name_str(&self) -> Option<&'a str> {
-        str::from_utf8(self.class_name).ok()
+    pub fn class_name(&self) -> &'a str {
+        str::from_utf8(self.class_name).unwrap_or("<non-ascii>")
+    }
+
+    /// Raw class-name bytes (short-string body, borrowed from the input
+    /// buffer).
+    #[inline]
+    pub fn class_name_bytes(&self) -> &'a [u8] {
+        self.class_name
     }
 }
 
@@ -173,12 +178,20 @@ pub fn scan<'a>(ctx: &BinaryContext<'a>) -> Vec<Vmt<'a>> {
             continue;
         };
         for &psize in widths {
-            let min_header = 11 * psize;
+            let Some(min_header) = 11usize.checked_mul(psize) else {
+                continue;
+            };
             if bytes.len() < min_header {
                 continue;
             }
             let mut i = 0usize;
-            while i + min_header <= bytes.len() {
+            loop {
+                let Some(window_end) = i.checked_add(min_header) else {
+                    break;
+                };
+                if window_end > bytes.len() {
+                    break;
+                }
                 if let Some(vmt) = try_parse_delphi(ctx, range, bytes, i, psize) {
                     if seen_va.insert(vmt.va) {
                         out.push(vmt);
@@ -188,7 +201,10 @@ pub fn scan<'a>(ctx: &BinaryContext<'a>) -> Vec<Vmt<'a>> {
                 {
                     out.push(vmt);
                 }
-                i += psize;
+                let Some(next) = i.checked_add(psize) else {
+                    break;
+                };
+                i = next;
             }
         }
     }
@@ -202,34 +218,40 @@ fn try_parse_delphi<'a>(
     off: usize,
     psize: usize,
 ) -> Option<Vmt<'a>> {
-    if off + 11 * psize > bytes.len() {
+    let min_size = 11usize.checked_mul(psize)?;
+    if off.checked_add(min_size)? > bytes.len() {
         return None;
     }
-    let base_va = range.va + off as u64;
+    let base_va = range.va.checked_add(off as u64)?;
 
     let self_ptr = read_ptr(bytes, off, psize)?;
     if self_ptr <= base_va {
         return None;
     }
-    let header_bytes = self_ptr - base_va;
+    let header_bytes = self_ptr.checked_sub(base_va)?;
     if !header_bytes.is_multiple_of(psize as u64) {
         return None;
     }
-    let slots = header_bytes / (psize as u64);
+    let slots = header_bytes.checked_div(psize as u64)?;
     if !(DELPHI_MIN_HEADER_SLOTS..=DELPHI_MAX_HEADER_SLOTS).contains(&slots) {
         return None;
     }
 
-    let intf_table = read_ptr(bytes, off + psize, psize)?;
-    let auto_table = read_ptr(bytes, off + 2 * psize, psize)?;
-    let init_table = read_ptr(bytes, off + 3 * psize, psize)?;
-    let type_info = read_ptr(bytes, off + 4 * psize, psize)?;
-    let field_table = read_ptr(bytes, off + 5 * psize, psize)?;
-    let method_table = read_ptr(bytes, off + 6 * psize, psize)?;
-    let dynamic_table = read_ptr(bytes, off + 7 * psize, psize)?;
-    let class_name_ptr = read_ptr(bytes, off + 8 * psize, psize)?;
-    let instance_size_raw = read_ptr(bytes, off + 9 * psize, psize)?;
-    let parent_vmt = read_ptr(bytes, off + 10 * psize, psize)?;
+    let mut slot_off = off;
+    let mut next_slot = || -> Option<usize> {
+        slot_off = slot_off.checked_add(psize)?;
+        Some(slot_off)
+    };
+    let intf_table = read_ptr(bytes, next_slot()?, psize)?;
+    let auto_table = read_ptr(bytes, next_slot()?, psize)?;
+    let init_table = read_ptr(bytes, next_slot()?, psize)?;
+    let type_info = read_ptr(bytes, next_slot()?, psize)?;
+    let field_table = read_ptr(bytes, next_slot()?, psize)?;
+    let method_table = read_ptr(bytes, next_slot()?, psize)?;
+    let dynamic_table = read_ptr(bytes, next_slot()?, psize)?;
+    let class_name_ptr = read_ptr(bytes, next_slot()?, psize)?;
+    let instance_size_raw = read_ptr(bytes, next_slot()?, psize)?;
+    let parent_vmt = read_ptr(bytes, next_slot()?, psize)?;
 
     if !is_plausible_instance_size(instance_size_raw, psize) {
         return None;
@@ -246,7 +268,7 @@ fn try_parse_delphi<'a>(
         pointer_size: psize as u8,
         header_slot_count: slots as u8,
         va: base_va,
-        file_offset: range.offset + off,
+        file_offset: range.offset.checked_add(off)?,
         self_ptr,
         intf_table,
         auto_table,
@@ -269,10 +291,11 @@ fn try_parse_fpc<'a>(
     off: usize,
     psize: usize,
 ) -> Option<Vmt<'a>> {
-    if off + FPC_MIN_SLOTS * psize > bytes.len() {
+    let min_size = FPC_MIN_SLOTS.checked_mul(psize)?;
+    if off.checked_add(min_size)? > bytes.len() {
         return None;
     }
-    let base_va = range.va + off as u64;
+    let base_va = range.va.checked_add(off as u64)?;
 
     let instance_size_raw = read_ptr(bytes, off, psize)?;
     if !is_plausible_instance_size(instance_size_raw, psize) {
@@ -280,10 +303,16 @@ fn try_parse_fpc<'a>(
     }
     let instance_size = instance_size_raw as u32;
 
+    let mut slot_off = off;
+    let mut next_slot = || -> Option<usize> {
+        slot_off = slot_off.checked_add(psize)?;
+        Some(slot_off)
+    };
+
     // Field 1: `vmtInstanceSize2` — FPC stores `-vmtInstanceSize` here,
     // truncated to pointer width. Required for validation; this is the
     // main discriminator that keeps FPC false-positive rates acceptable.
-    let size2 = read_ptr(bytes, off + psize, psize)?;
+    let size2 = read_ptr(bytes, next_slot()?, psize)?;
     let expected_neg = match psize {
         4 => (!(instance_size as u64)).wrapping_add(1) & 0xFFFF_FFFF,
         _ => (!instance_size_raw).wrapping_add(1),
@@ -293,30 +322,30 @@ fn try_parse_fpc<'a>(
     }
 
     // Field 2: parent VMT.
-    let parent_vmt = read_ptr(bytes, off + 2 * psize, psize)?;
+    let parent_vmt = read_ptr(bytes, next_slot()?, psize)?;
 
     // Field 3: class name short-string.
-    let class_name_ptr = read_ptr(bytes, off + 3 * psize, psize)?;
+    let class_name_ptr = read_ptr(bytes, next_slot()?, psize)?;
     let class_name = read_short_string_at_va(ctx, class_name_ptr)?;
     if !is_plausible_class_name(class_name) {
         return None;
     }
 
     // Field 4..10: tables. We accept any value; these are used downstream.
-    let dynamic_table = read_ptr(bytes, off + 4 * psize, psize)?;
-    let method_table = read_ptr(bytes, off + 5 * psize, psize)?;
-    let field_table = read_ptr(bytes, off + 6 * psize, psize)?;
-    let type_info = read_ptr(bytes, off + 7 * psize, psize)?;
-    let init_table = read_ptr(bytes, off + 8 * psize, psize)?;
-    let auto_table = read_ptr(bytes, off + 9 * psize, psize)?;
-    let intf_table = read_ptr(bytes, off + 10 * psize, psize)?;
+    let dynamic_table = read_ptr(bytes, next_slot()?, psize)?;
+    let method_table = read_ptr(bytes, next_slot()?, psize)?;
+    let field_table = read_ptr(bytes, next_slot()?, psize)?;
+    let type_info = read_ptr(bytes, next_slot()?, psize)?;
+    let init_table = read_ptr(bytes, next_slot()?, psize)?;
+    let auto_table = read_ptr(bytes, next_slot()?, psize)?;
+    let intf_table = read_ptr(bytes, next_slot()?, psize)?;
 
     Some(Vmt {
         flavor: VmtFlavor::Fpc,
         pointer_size: psize as u8,
         header_slot_count: 0,
         va: base_va,
-        file_offset: range.offset + off,
+        file_offset: range.offset.checked_add(off)?,
         self_ptr: 0,
         intf_table,
         auto_table,
@@ -350,7 +379,9 @@ fn is_plausible_class_name(name: &[u8]) -> bool {
     // Must start with an uppercase letter, underscore, or `@` (compiler-
     // synthesised names). Historically every Delphi / FPC class starts
     // with `T` / `I` / `E` / `C`, but we accept any upper-case letter.
-    let first = name[0];
+    let Some(&first) = name.first() else {
+        return false;
+    };
     first.is_ascii_uppercase() || first == b'_' || first == b'@'
 }
 

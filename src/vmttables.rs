@@ -11,7 +11,7 @@
 //! managed records). The runtime consumes this table during
 //! `AfterConstruction` and `Destroy` to initialise and finalise those
 //! fields. Decoding it is a straight reuse of
-//! [`crate::rtti::decode_tkrecord`].
+//! [`crate::rtti::RecordInfo::from_va`].
 //!
 //! Source: FPC `rtl/inc/rtti.inc` — `InitializeArray` / `FinalizeArray`.
 //!
@@ -39,18 +39,22 @@
 use crate::{
     formats::BinaryContext,
     limits::MAX_DYNAMIC_SLOTS_PER_CLASS,
-    rtti::{RecordInfo, decode_tkrecord},
+    rtti::RecordInfo,
     util::{read_ptr, read_u16},
     vmt::Vmt,
 };
 
-/// Decode the init (managed-fields) table. Returns `None` when
-/// `vmtInitTable` is null or the pointed-at record can't be decoded.
-pub fn decode_init_table<'a>(ctx: &BinaryContext<'a>, vmt: &Vmt<'a>) -> Option<RecordInfo<'a>> {
-    if vmt.init_table == 0 {
-        return None;
+impl<'a> RecordInfo<'a> {
+    /// Decode the class's init (managed-fields) table — the
+    /// `vmtInitTable` synthetic record that enumerates instance
+    /// offsets the runtime needs to refcount-manage. Returns `None`
+    /// when `vmtInitTable` is null or the record can't be decoded.
+    pub fn from_init_table(ctx: &BinaryContext<'a>, vmt: &Vmt<'a>) -> Option<Self> {
+        if vmt.init_table == 0 {
+            return None;
+        }
+        Self::from_va(ctx, vmt.init_table, vmt.flavor)
     }
-    decode_tkrecord(ctx, vmt.init_table, vmt.flavor)
 }
 
 /// One entry in the dynamic-dispatch table.
@@ -63,33 +67,53 @@ pub struct DynamicSlot {
     pub handler_va: u64,
 }
 
-/// Decode the dynamic-dispatch table.
-pub fn decode_dynamic_table(ctx: &BinaryContext<'_>, vmt: &Vmt<'_>) -> Vec<DynamicSlot> {
-    if vmt.dynamic_table == 0 {
-        return Vec::new();
-    }
-    let Some(file_off) = ctx.va_to_file(vmt.dynamic_table) else {
-        return Vec::new();
-    };
-    let data = ctx.data();
-    let Some(count) = read_u16(data, file_off).map(usize::from) else {
-        return Vec::new();
-    };
-    if count == 0 || count > MAX_DYNAMIC_SLOTS_PER_CLASS {
-        return Vec::new();
-    }
-    let psize = vmt.pointer_size as usize;
-    let mut out = Vec::with_capacity(count);
-    let indexes_off = file_off + 2;
-    let handlers_off = indexes_off + count * 2;
-    for i in 0..count {
-        let Some(index) = read_u16(data, indexes_off + i * 2).map(|u| u as i16) else {
-            break;
+impl DynamicSlot {
+    /// Decode the dynamic-dispatch table for `vmt`. Returns an empty
+    /// vector when `vmtDynamicTable` is null or the layout walk
+    /// bails.
+    pub fn iter(ctx: &BinaryContext<'_>, vmt: &Vmt<'_>) -> Vec<Self> {
+        if vmt.dynamic_table == 0 {
+            return Vec::new();
+        }
+        let Some(file_off) = ctx.va_to_file(vmt.dynamic_table) else {
+            return Vec::new();
         };
-        let Some(handler_va) = read_ptr(data, handlers_off + i * psize, psize) else {
-            break;
+        let data = ctx.data();
+        let Some(count) = read_u16(data, file_off).map(usize::from) else {
+            return Vec::new();
         };
-        out.push(DynamicSlot { index, handler_va });
+        if count == 0 || count > MAX_DYNAMIC_SLOTS_PER_CLASS {
+            return Vec::new();
+        }
+        let psize = vmt.pointer_size as usize;
+        let mut out = Vec::with_capacity(count);
+        let Some(indexes_off) = file_off.checked_add(2) else {
+            return Vec::new();
+        };
+        let Some(handlers_off) = count
+            .checked_mul(2)
+            .and_then(|n| indexes_off.checked_add(n))
+        else {
+            return Vec::new();
+        };
+        for i in 0..count {
+            let Some(index_off) = i.checked_mul(2).and_then(|n| indexes_off.checked_add(n)) else {
+                break;
+            };
+            let Some(index) = read_u16(data, index_off).map(|u| u as i16) else {
+                break;
+            };
+            let Some(handler_off) = i
+                .checked_mul(psize)
+                .and_then(|n| handlers_off.checked_add(n))
+            else {
+                break;
+            };
+            let Some(handler_va) = read_ptr(data, handler_off, psize) else {
+                break;
+            };
+            out.push(Self { index, handler_va });
+        }
+        out
     }
-    out
 }

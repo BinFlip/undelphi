@@ -10,7 +10,10 @@
 //! properties (from the field / method / RTTI tables) land in iteration 3;
 //! see `RESEARCH.md §13.4` for the delivery plan.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    fmt::Write,
+};
 
 use crate::{
     formats::BinaryContext,
@@ -31,8 +34,9 @@ pub struct Class<'a> {
 impl<'a> Class<'a> {
     /// Class name as `&str`, falling back to `"<non-ascii>"` if the bytes are
     /// not UTF-8. Delphi names are always ASCII in practice.
+    #[inline]
     pub fn name(&self) -> &'a str {
-        self.vmt.class_name_str().unwrap_or("<non-ascii>")
+        self.vmt.class_name()
     }
 
     /// Instance size in bytes.
@@ -83,6 +87,14 @@ impl<'a> Class<'a> {
     pub fn has_type_info(&self) -> bool {
         self.vmt.type_info != 0
     }
+
+    /// Resolve this class's parent against a [`ClassSet`]. `None` for root
+    /// classes (`TObject`) and for classes whose parent VMT lies outside
+    /// the scanned region.
+    #[inline]
+    pub fn parent(&self, set: &'a ClassSet<'a>) -> Option<&'a Class<'a>> {
+        set.get(self.parent_index?)
+    }
 }
 
 /// Ordered collection of classes discovered in a binary, indexed for fast
@@ -128,7 +140,7 @@ impl<'a> ClassSet<'a> {
         for (i, vmt) in vmts.into_iter().enumerate() {
             let parent_index = resolve_parent(&vmt, &by_vmt_va, ctx);
             let class = Class { vmt, parent_index };
-            if let Some(name) = class.vmt.class_name_str() {
+            if let Ok(name) = core::str::from_utf8(class.vmt.class_name_bytes()) {
                 by_name.entry(name).or_insert(i);
             }
             classes.push(class);
@@ -157,6 +169,16 @@ impl<'a> ClassSet<'a> {
     #[inline]
     pub fn iter(&self) -> impl Iterator<Item = &Class<'a>> {
         self.classes.iter()
+    }
+
+    /// Iterate `(class, parent)` pairs in discovery order. `parent` is
+    /// `None` for root classes (`TObject`) and for classes whose parent
+    /// VMT lies outside the scanned region (typically classes inherited
+    /// from a runtime package).
+    pub fn iter_with_parents(&self) -> impl Iterator<Item = (&Class<'a>, Option<&Class<'a>>)> {
+        self.classes
+            .iter()
+            .map(|c| (c, c.parent_index.and_then(|idx| self.classes.get(idx))))
     }
 
     /// Access a class by its index. Panics on out-of-bounds.
@@ -274,18 +296,22 @@ impl<'a> ClassSet<'a> {
 
     /// Maximum depth of the class tree (root = depth 0).
     pub fn max_depth(&self) -> usize {
-        let mut best = 0;
-        for i in 0..self.classes.len() {
-            let mut depth = 0;
-            let mut node = self.classes[i].parent_index;
-            let mut visited = 0;
+        let mut best = 0usize;
+        let total = self.classes.len();
+        for class in &self.classes {
+            let mut depth = 0usize;
+            let mut node = class.parent_index;
+            let mut visited = 0usize;
             while let Some(idx) = node {
-                depth += 1;
-                visited += 1;
-                if visited > self.classes.len() {
+                depth = depth.saturating_add(1);
+                visited = visited.saturating_add(1);
+                if visited > total {
                     break; // cycle guard
                 }
-                node = self.classes[idx].parent_index;
+                let Some(parent) = self.classes.get(idx) else {
+                    break;
+                };
+                node = parent.parent_index;
             }
             if depth > best {
                 best = depth;
@@ -318,7 +344,8 @@ fn resolve_parent<'a>(
     let psize = vmt.pointer_size as usize;
     let file_off = ctx.va_to_file(vmt.parent_vmt)?;
     let data = ctx.data();
-    let slice = data.get(file_off..file_off + psize)?;
+    let end = file_off.checked_add(psize)?;
+    let slice = data.get(file_off..end)?;
     let deref = match psize {
         4 => u32::from_le_bytes(slice.try_into().ok()?) as u64,
         8 => u64::from_le_bytes(slice.try_into().ok()?),
@@ -335,7 +362,6 @@ fn render_tree_node(
     max_children: usize,
     out: &mut String,
 ) {
-    use std::fmt::Write;
     let Some(class) = set.classes.get(idx) else {
         return;
     };
@@ -350,11 +376,21 @@ fn render_tree_node(
     );
     if let Some(children) = child_map.get(&idx) {
         let shown = children.len().min(max_children);
-        for &child in &children[..shown] {
-            render_tree_node(set, child_map, child, depth + 1, max_children, out);
+        if let Some(slice) = children.get(..shown) {
+            for &child in slice {
+                render_tree_node(
+                    set,
+                    child_map,
+                    child,
+                    depth.saturating_add(1),
+                    max_children,
+                    out,
+                );
+            }
         }
         if children.len() > shown {
-            let _ = writeln!(out, "{}  ... {} more children", pad, children.len() - shown);
+            let extra = children.len().saturating_sub(shown);
+            let _ = writeln!(out, "{}  ... {} more children", pad, extra);
         }
     }
 }

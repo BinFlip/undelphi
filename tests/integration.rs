@@ -17,7 +17,6 @@ use undelphi::{
     dfm::DfmValue,
     dvclal::Edition,
     extrtti::Visibility,
-    formats::BinaryFormat,
     layout::reconstruct,
     render::render_enum_ordinal,
     rtti::{TypeDetail, TypeKind},
@@ -34,9 +33,9 @@ fn assert_has_method(bin: &DelphiBinary<'_>, class_name: &str, method_name: &str
         .unwrap_or_else(|| panic!("expected class {class_name} to exist"));
     let methods = bin.methods(class);
     assert!(
-        methods.iter().any(|m| m.name_str() == method_name),
+        methods.iter().any(|m| m.name() == method_name),
         "{class_name} should publish method {method_name}; got {:?}",
-        methods.iter().map(|m| m.name_str()).collect::<Vec<_>>()
+        methods.iter().map(|m| m.name()).collect::<Vec<_>>()
     );
 }
 
@@ -72,7 +71,7 @@ fn heidisql_win64_delphi_12_athens() {
         return;
     };
     let bin = DelphiBinary::parse(&data).expect("should detect delphi binary");
-    assert_eq!(bin.format(), BinaryFormat::Pe);
+    assert!(bin.format().is_pe());
 
     let info = bin.compiler().expect("should have build-string");
     assert_eq!(info.compiler, Compiler::Delphi);
@@ -145,11 +144,35 @@ fn heidisql_win64_delphi_12_athens() {
         "{00000000-0000-0000-C000-000000000046}"
     );
 
+    // interface_methods walks vtable_va. IUnknown has 3 slots
+    // (QueryInterface, AddRef, Release); the heuristic should recover
+    // at least those, may include more if adjacent code follows.
+    let imethods = bin.interface_methods(&ifaces[0]);
+    assert!(
+        imethods.len() >= 3,
+        "expected ≥3 IUnknown methods, got {}",
+        imethods.len()
+    );
+    for (i, m) in imethods.iter().enumerate().take(3) {
+        assert_eq!(m.slot_index as usize, i);
+        assert!(m.code_va != 0);
+    }
+
+    // class_attributes: heidisql declares attributes on at least a
+    // handful of classes via modern extended RTTI. We don't pin the
+    // exact count (sample-dependent) but require the walker discovers
+    // at least one across the whole class set.
+    let attrs_total: usize = classes.iter().map(|c| bin.class_attributes(c).len()).sum();
+    assert!(
+        attrs_total > 0,
+        "expected at least one class with attributes via the trailer walker"
+    );
+
     // Iteration 4: published properties. TForm should expose 100+ and
     // classic VCL names must be present.
     let props = bin.properties(tform);
     assert!(props.len() > 50, "TForm property count: {}", props.len());
-    let names: Vec<_> = props.iter().map(|p| p.name_str()).collect();
+    let names: Vec<_> = props.iter().map(|p| p.name()).collect();
     for expected in ["Caption", "Action", "Align", "BorderIcons"] {
         assert!(
             names.contains(&expected),
@@ -165,44 +188,61 @@ fn heidisql_win64_delphi_12_athens() {
         fields.len()
     );
 
+    // code_entrypoints() should aggregate thousands of VAs on a binary
+    // this size; check ordering of magnitude to catch regressions in the
+    // aggregation glue.
+    let entrypoints = bin.code_entrypoints();
+    assert!(
+        entrypoints.len() > 1000,
+        "code_entrypoints count: {}",
+        entrypoints.len()
+    );
+    use undelphi::entrypoints::EntrypointKind;
+    assert!(
+        entrypoints
+            .iter()
+            .any(|e| e.kind == EntrypointKind::PublishedMethod),
+        "expected at least one PublishedMethod entrypoint"
+    );
+
     // Iteration 4: forms parsed from DFM resources.
     let forms = bin.forms();
     assert!(forms.len() >= 20, "parsed form count: {}", forms.len());
     // Find the About-box form and inspect a Caption.
     let about = forms
         .iter()
-        .find(|(_, obj)| obj.class_name == b"TAboutBox")
+        .find(|(_, obj)| obj.class_name() == "TAboutBox")
         .expect("TAboutBox form should parse");
     let caption = about
         .1
         .properties
         .iter()
-        .find(|p| p.name_str() == "Caption")
+        .find(|p| p.name() == "Caption")
         .expect("TAboutBox must have a Caption");
     match &caption.value {
-        DfmValue::String(s) => assert_eq!(*s, b"About"),
+        DfmValue::String(s) => assert_eq!(*s, *b"About"),
         other => panic!("expected Caption=String, got {other:?}"),
     }
 
     // Iteration 5: property-type resolution + enumeration catalog.
     let prop_caption = props
         .iter()
-        .find(|p| p.name_str() == "Caption")
+        .find(|p| p.name() == "Caption")
         .expect("TForm.Caption must exist");
     let caption_ty = bin
         .property_type(tform, prop_caption)
         .expect("TForm.Caption must have resolved type");
-    assert_eq!(caption_ty.name_str(), "TCaption");
+    assert_eq!(caption_ty.name(), "TCaption");
     assert_eq!(caption_ty.kind, TypeKind::UString);
 
     let prop_align = props
         .iter()
-        .find(|p| p.name_str() == "Align")
+        .find(|p| p.name() == "Align")
         .expect("TForm.Align must exist");
     let align_ty = bin
         .property_type(tform, prop_align)
         .expect("TForm.Align must have resolved type");
-    assert_eq!(align_ty.name_str(), "TAlign");
+    assert_eq!(align_ty.name(), "TAlign");
     assert_eq!(align_ty.kind, TypeKind::Enumeration);
 
     // Decode TAlign's enumeration values.
@@ -224,14 +264,14 @@ fn heidisql_win64_delphi_12_athens() {
     // Iteration 6: per-Kind TypeDetail on properties.
     let prop_anchors = props
         .iter()
-        .find(|p| p.name_str() == "Anchors")
+        .find(|p| p.name() == "Anchors")
         .expect("TForm.Anchors");
     let detail = bin
         .property_type_detail(tform, prop_anchors)
         .expect("Anchors detail");
     match detail {
         TypeDetail::Set(s) => {
-            assert_eq!(s.header.name_str(), "TAnchors");
+            assert_eq!(s.header.name(), "TAnchors");
             let elem = s
                 .element_type
                 .expect("TAnchors must resolve its element type");
@@ -266,7 +306,7 @@ fn heidisql_win64_delphi_12_athens() {
     );
 
     // Iteration 7: tkMethod decoder on TNotifyEvent-shaped event.
-    let tcomp_on_change = props.iter().find(|p| p.name_str() == "Action");
+    let tcomp_on_change = props.iter().find(|p| p.name() == "Action");
     let _ = tcomp_on_change; // keep one use
 
     // Iteration 7: event-handler cross-link.
@@ -274,9 +314,9 @@ fn heidisql_win64_delphi_12_athens() {
     // Pick a form with an OnCreate / OnShow / etc.
     let mut resolved = 0;
     for (_, obj) in forms {
-        if let Some(cl) = classes.find_by_name(obj.class_name_str()) {
+        if let Some(cl) = classes.find_by_name(obj.class_name()) {
             for p in &obj.properties {
-                if p.name_str().starts_with("On")
+                if p.name().starts_with("On")
                     && let DfmValue::String(m) = &p.value
                     && let Ok(name) = str::from_utf8(m)
                     && bin.resolve_event_handler(cl, name).is_some()
@@ -338,7 +378,7 @@ fn doublecmd_win32_fpc_322() {
         return;
     };
     let bin = DelphiBinary::parse(&data).expect("should detect fpc binary");
-    assert_eq!(bin.format(), BinaryFormat::Pe);
+    assert!(bin.format().is_pe());
 
     let info = bin.compiler().expect("should have FPC build-string");
     assert_eq!(info.compiler, Compiler::FreePascal);
@@ -369,6 +409,23 @@ fn doublecmd_win32_fpc_322() {
     // Methods extracted via FPC's PShortString-deref layout.
     let methods = bin.methods(tmain);
     assert!(methods.len() > 50);
+
+    // unit_init_procs: FPC INITFINAL table located via heuristic shape
+    // scan (the symbol table is stripped on this build). Lazarus apps
+    // pull in dozens of units; expect at least 30 entries.
+    let procs = bin.unit_init_procs();
+    assert!(
+        procs.len() >= 30,
+        "expected ≥30 unit init procs from FPC INITFINAL table, got {}",
+        procs.len()
+    );
+    // At least one entry should carry a non-zero init or finalize VA.
+    assert!(
+        procs
+            .iter()
+            .any(|p| p.init_va.is_some() || p.finalize_va.is_some()),
+        "every entry was a no-op — heuristic likely locked onto garbage"
+    );
 }
 
 #[test]
@@ -378,7 +435,7 @@ fn cheatengine_win64_fpc_304() {
         return;
     };
     let bin = DelphiBinary::parse(&data).expect("should detect fpc binary");
-    assert_eq!(bin.format(), BinaryFormat::Pe);
+    assert!(bin.format().is_pe());
 
     let info = bin.compiler().expect("should have FPC build-string");
     assert_eq!(info.compiler, Compiler::FreePascal);
@@ -410,7 +467,7 @@ fn heidisql_macos_aarch64_fpc_322() {
         return;
     };
     let bin = DelphiBinary::parse(&data).expect("should detect fpc mach-o");
-    assert_eq!(bin.format(), BinaryFormat::MachO);
+    assert!(bin.format().is_macho());
 
     let info = bin.compiler().expect("should have FPC build-string");
     assert_eq!(info.compiler, Compiler::FreePascal);
@@ -447,7 +504,7 @@ fn heidisql_macos_aarch64_fpc_322() {
     let forms = bin.forms();
     assert!(forms.len() >= 10, "macOS FPC form count: {}", forms.len());
     assert!(
-        forms.iter().any(|(_, o)| o.class_name == b"TAboutBox"),
+        forms.iter().any(|(_, o)| o.class_name() == "TAboutBox"),
         "TAboutBox should appear in macOS forms"
     );
 }
@@ -459,7 +516,7 @@ fn idr64_delphi_32bit() {
         return;
     };
     let bin = DelphiBinary::parse(&data).expect("should detect delphi");
-    assert_eq!(bin.format(), BinaryFormat::Pe);
+    assert!(bin.format().is_pe());
 
     // IDR64.exe ships without an Embarcadero build-string but carries the
     // legacy `SOFTWARE\Borland\Delphi\RTL` registry marker.
@@ -481,7 +538,7 @@ fn lightalloy_delphi_7_legacy_detection() {
         return;
     };
     let bin = DelphiBinary::parse(&data).expect("should detect delphi via legacy marker");
-    assert_eq!(bin.format(), BinaryFormat::Pe);
+    assert!(bin.format().is_pe());
 
     let info = bin.compiler().expect("should fall back to Borland marker");
     assert_eq!(info.compiler, Compiler::Delphi);
@@ -503,7 +560,7 @@ fn heidisql_xe5_namespaced_detection() {
         return;
     };
     let bin = DelphiBinary::parse(&data).expect("should detect delphi via namespaced marker");
-    assert_eq!(bin.format(), BinaryFormat::Pe);
+    assert!(bin.format().is_pe());
 
     let info = bin
         .compiler()
@@ -525,9 +582,9 @@ fn heidisql_xe5_packed_is_rejected_not_crashed() {
         eprintln!("skipping: sample missing");
         return;
     };
-    // UPX-packed binary strips all markers; the parser must return None
+    // UPX-packed binary strips all markers; the parser must return Err
     // rather than panic or return a false-positive identification.
-    assert!(DelphiBinary::parse(&data).is_none());
+    assert!(DelphiBinary::parse(&data).is_err());
 }
 
 #[test]
@@ -537,7 +594,7 @@ fn delphilint_bpl_delphi_12_buildstring() {
         return;
     };
     let bin = DelphiBinary::parse(&data).expect("should detect delphi");
-    assert_eq!(bin.format(), BinaryFormat::Pe);
+    assert!(bin.format().is_pe());
 
     let info = bin.compiler().expect("BPL carries build-string");
     assert_eq!(info.compiler, Compiler::Delphi);
@@ -582,7 +639,7 @@ fn standalone_exes_have_exactly_one_root() {
             continue; // sample missing, skip
         };
         let bin =
-            DelphiBinary::parse(&data).unwrap_or_else(|| panic!("{rel}: should parse as delphi"));
+            DelphiBinary::parse(&data).unwrap_or_else(|_| panic!("{rel}: should parse as delphi"));
         let classes = bin.classes();
         assert_eq!(
             classes.root_count(),
@@ -594,7 +651,7 @@ fn standalone_exes_have_exactly_one_root() {
 }
 
 #[test]
-fn garbage_input_returns_none() {
+fn garbage_input_returns_err() {
     let data = b"this is not a delphi binary at all, just random ascii";
-    assert!(DelphiBinary::parse(data).is_none());
+    assert!(DelphiBinary::parse(data).is_err());
 }

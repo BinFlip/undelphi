@@ -1,6 +1,6 @@
 [package]
 name = "undelphi"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["Johann Kempter <admin@binflip.rs>"]
 rust-version = "1.88"
@@ -12,8 +12,15 @@ keywords = ["delphi", "pascal", "parser", "reverse-engineering", "binary-analysi
 categories = ["parser-implementations"]
 exclude = ["tests/samples/", "reference/", "research/"]
 
+[features]
+default = []
+# Emit `tracing` events from sub-parsers when they bail out on truncated /
+# corrupt input. Off by default — drops a `tracing` dep into your build.
+tracing = ["dep:tracing"]
+
 [dependencies]
 goblin = "0.10.5"
 scroll = "0.13.0"
+tracing = { version = "0.1.44", optional = true }
 
 [dev-dependencies]

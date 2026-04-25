@@ -34,7 +34,7 @@
 //! the basic entry; they are referenced through the method table trailer
 //! and decoded in iteration 4.
 
-use core::str;
+use std::str;
 
 use crate::{
     formats::BinaryContext,
@@ -47,8 +47,11 @@ use crate::{
 #[derive(Debug, Clone, Copy)]
 pub struct MethodEntry<'a> {
     /// Method name (short-string body, borrowed from the input).
-    pub name: &'a [u8],
+    pub(crate) name: &'a [u8],
     /// Virtual address of the method's code entry point.
+    ///
+    /// This is an absolute VA. For PE consumers operating in RVA space,
+    /// subtract the image base.
     pub code_va: u64,
     /// Extra bytes trailing the bare entry, when the compiler emitted an
     /// extended `TVmtMethodExEntry` record (modern Delphi / FPC). Empty
@@ -57,21 +60,40 @@ pub struct MethodEntry<'a> {
 }
 
 impl<'a> MethodEntry<'a> {
-    /// Name as `&str`, falling back to `"<non-ascii>"` for unusual bytes.
-    pub fn name_str(&self) -> &'a str {
+    /// Method name as `&str`, lossily decoded. Pascal identifiers are ASCII
+    /// in practice; non-UTF-8 bytes fall back to `"<non-ascii>"`.
+    #[inline]
+    pub fn name(&self) -> &'a str {
         str::from_utf8(self.name).unwrap_or("<non-ascii>")
+    }
+
+    /// Raw method name bytes (short-string body, borrowed from the input).
+    #[inline]
+    pub fn name_bytes(&self) -> &'a [u8] {
+        self.name
     }
 }
 
-/// Collect all published methods of a class. Returns an empty vector if
-/// the class has no method table or the table is malformed.
-pub fn iter_methods<'a>(ctx: &BinaryContext<'a>, vmt: &Vmt<'a>) -> Vec<MethodEntry<'a>> {
-    if vmt.method_table == 0 {
-        return Vec::new();
-    }
-    match vmt.flavor {
-        VmtFlavor::Delphi => iter_delphi(ctx, vmt).unwrap_or_default(),
-        VmtFlavor::Fpc => iter_fpc(ctx, vmt).unwrap_or_default(),
+impl<'a> MethodEntry<'a> {
+    /// Collect all published methods declared on `vmt`. Returns an
+    /// empty vector if the class has no method table or the table is
+    /// malformed.
+    pub fn iter(ctx: &BinaryContext<'a>, vmt: &Vmt<'a>) -> Vec<Self> {
+        if vmt.method_table == 0 {
+            return Vec::new();
+        }
+        let result = match vmt.flavor {
+            VmtFlavor::Delphi => iter_delphi(ctx, vmt),
+            VmtFlavor::Fpc => iter_fpc(ctx, vmt),
+        };
+        result.unwrap_or_else(|| {
+            crate::__undelphi_trace_warn!(
+                vmt_va = vmt.va,
+                method_table = vmt.method_table,
+                "MethodEntry::iter: method-table walk bailed out"
+            );
+            Vec::new()
+        })
     }
 }
 
@@ -85,7 +107,7 @@ fn iter_delphi<'a>(ctx: &BinaryContext<'a>, vmt: &Vmt<'a>) -> Option<Vec<MethodE
 
     let psize = vmt.pointer_size as usize;
     let mut out = Vec::with_capacity(count);
-    let mut cursor = base_off + 2;
+    let mut cursor = base_off.checked_add(2)?;
 
     for _ in 0..count {
         let size = read_u16(data, cursor)? as usize;
@@ -93,13 +115,23 @@ fn iter_delphi<'a>(ctx: &BinaryContext<'a>, vmt: &Vmt<'a>) -> Option<Vec<MethodE
             // Guard against malformed tables that would loop forever.
             break;
         }
-        let code_va = read_ptr(data, cursor + 2, psize)?;
-        let name = read_short_string_at_file(data, cursor + 2 + psize)?;
+        let code_off = cursor.checked_add(2)?;
+        let code_va = read_ptr(data, code_off, psize)?;
+        let name_off = code_off.checked_add(psize)?;
+        let name = read_short_string_at_file(data, name_off)?;
         // Bare entry = 2 (Size u16) + psize (CodeAddr) + 1 (name length byte) + name bytes.
         // Anything beyond that is the modern extended-RTTI trailer.
-        let bare = 2 + psize + 1 + name.len();
+        let bare = 2usize
+            .checked_add(psize)?
+            .checked_add(1)?
+            .checked_add(name.len())?;
         let trailer = if size > bare {
-            data.get(cursor + bare..cursor + size).unwrap_or(&[])
+            let trailer_start = cursor.checked_add(bare)?;
+            let trailer_end = cursor.checked_add(size)?;
+            // If the entry's declared size walks past EOF, the table is
+            // malformed — surface the parse failure rather than silently
+            // truncating the trailer to empty.
+            data.get(trailer_start..trailer_end)?
         } else {
             &[]
         };
@@ -108,7 +140,7 @@ fn iter_delphi<'a>(ctx: &BinaryContext<'a>, vmt: &Vmt<'a>) -> Option<Vec<MethodE
             code_va,
             trailer,
         });
-        cursor += size;
+        cursor = cursor.checked_add(size)?;
     }
     Some(out)
 }
@@ -124,14 +156,14 @@ fn iter_fpc<'a>(ctx: &BinaryContext<'a>, vmt: &Vmt<'a>) -> Option<Vec<MethodEntr
     }
 
     let psize = vmt.pointer_size as usize;
-    let entries_off = base_off + 4;
-    let entry_size = 2 * psize;
+    let entries_off = base_off.checked_add(4)?;
+    let entry_size = psize.checked_mul(2)?;
     let mut out = Vec::with_capacity(count);
 
     for i in 0..count {
-        let off = entries_off + i * entry_size;
+        let off = entries_off.checked_add(i.checked_mul(entry_size)?)?;
         let name_ptr_va = read_ptr(data, off, psize)?;
-        let code_va = read_ptr(data, off + psize, psize)?;
+        let code_va = read_ptr(data, off.checked_add(psize)?, psize)?;
         let Some(name) = read_short_string_at_va(ctx, name_ptr_va) else {
             continue;
         };

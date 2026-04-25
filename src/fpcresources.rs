@@ -44,7 +44,7 @@
 //!
 //! Resource-body slices are borrowed directly from the binary.
 
-use core::str;
+use std::str;
 
 use crate::{formats::BinaryContext, limits::MAX_FPC_RESOURCE_SIBLINGS, util::read_ptr};
 
@@ -90,7 +90,11 @@ pub fn iter_type<'a>(ctx: &BinaryContext<'a>, type_id: u32) -> Vec<FpcResource<'
     let Some(section_bytes) = ctx.section_data(&section) else {
         return Vec::new();
     };
-    let ptr_size = ctx.pointer_size().unwrap_or(8);
+    // We require a valid pointer size. If the container parse failed
+    // we cannot reliably decode the resource tree — bail.
+    let Some(ptr_size) = ctx.pointer_size() else {
+        return Vec::new();
+    };
     // The TResHdr sits at the start of the section — rootptr is its first
     // pointer-sized field.
     let root_va = match read_ptr(section_bytes, 0, ptr_size) {
@@ -103,14 +107,14 @@ pub fn iter_type<'a>(ctx: &BinaryContext<'a>, type_id: u32) -> Vec<FpcResource<'
     let Some(root) = read_node(ctx, root_va, ptr_size) else {
         return out;
     };
-    let type_total = root.ncount as usize + root.idcount as usize;
+    let type_total = (root.ncount as usize).saturating_add(root.idcount as usize);
     for type_node in iter_siblings(ctx, root.subptr, type_total, ptr_size) {
         if !type_node.name_or_id_is_integer() || type_node.name_or_id as u32 != type_id {
             continue;
         }
-        let name_total = type_node.ncount as usize + type_node.idcount as usize;
+        let name_total = (type_node.ncount as usize).saturating_add(type_node.idcount as usize);
         for name_node in iter_siblings(ctx, type_node.subptr, name_total, ptr_size) {
-            let lang_total = name_node.ncount as usize + name_node.idcount as usize;
+            let lang_total = (name_node.ncount as usize).saturating_add(name_node.idcount as usize);
             for lang_node in iter_siblings(ctx, name_node.subptr, lang_total, ptr_size) {
                 // Leaf: subptr → bytes, idcountsize → length.
                 let Some(body) = slice_resource_body(ctx, lang_node.subptr, lang_node.idcountsize)
@@ -145,8 +149,11 @@ struct Node {
 }
 
 impl Node {
-    fn node_byte_size(ptr_size: usize) -> usize {
-        ptr_size + 4 + 4 + ptr_size
+    fn node_byte_size(ptr_size: usize) -> Option<usize> {
+        ptr_size
+            .checked_add(4)?
+            .checked_add(4)?
+            .checked_add(ptr_size)
     }
 
     fn name_or_id_is_integer(&self) -> bool {
@@ -168,12 +175,10 @@ impl Node {
         let off = ctx.va_to_file(self.name_or_id)?;
         let data = ctx.data();
         // Null-terminated C string.
-        let end = data
-            .iter()
-            .skip(off)
-            .position(|&b| b == 0)
-            .map(|p| off + p)?;
-        let bytes = &data[off..end];
+        let tail = data.get(off..)?;
+        let rel = tail.iter().position(|&b| b == 0)?;
+        let end = off.checked_add(rel)?;
+        let bytes = data.get(off..end)?;
         str::from_utf8(bytes).ok().map(str::to_owned)
     }
 }
@@ -182,17 +187,14 @@ fn read_node(ctx: &BinaryContext<'_>, va: u64, ptr_size: usize) -> Option<Node> 
     let off = ctx.va_to_file(va)?;
     let data = ctx.data();
     let name_or_id = read_ptr(data, off, ptr_size)?;
-    let ncount = u32::from_le_bytes(
-        data.get(off + ptr_size..off + ptr_size + 4)?
-            .try_into()
-            .ok()?,
-    );
-    let idcount = u32::from_le_bytes(
-        data.get(off + ptr_size + 4..off + ptr_size + 8)?
-            .try_into()
-            .ok()?,
-    );
-    let subptr = read_ptr(data, off + ptr_size + 8, ptr_size)?;
+    let ncount_off = off.checked_add(ptr_size)?;
+    let idcount_off = ncount_off.checked_add(4)?;
+    let subptr_off = idcount_off.checked_add(4)?;
+    let ncount_end = ncount_off.checked_add(4)?;
+    let idcount_end = idcount_off.checked_add(4)?;
+    let ncount = u32::from_le_bytes(data.get(ncount_off..ncount_end)?.try_into().ok()?);
+    let idcount = u32::from_le_bytes(data.get(idcount_off..idcount_end)?.try_into().ok()?);
+    let subptr = read_ptr(data, subptr_off, ptr_size)?;
     Some(Node {
         name_or_id,
         ncount,
@@ -213,10 +215,18 @@ fn iter_siblings(
     if first_va == 0 || count > MAX_FPC_RESOURCE_SIBLINGS {
         return Vec::new();
     }
-    let sz = Node::node_byte_size(ptr_size) as u64;
+    let Some(stride) = Node::node_byte_size(ptr_size) else {
+        return Vec::new();
+    };
+    let stride = stride as u64;
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
-        let va = first_va + i as u64 * sz;
+        let Some(offset) = (i as u64).checked_mul(stride) else {
+            break;
+        };
+        let Some(va) = first_va.checked_add(offset) else {
+            break;
+        };
         let Some(node) = read_node(ctx, va, ptr_size) else {
             break;
         };
@@ -230,5 +240,6 @@ fn slice_resource_body<'a>(ctx: &BinaryContext<'a>, data_va: u64, size: u32) -> 
         return None;
     }
     let off = ctx.va_to_file(data_va)?;
-    ctx.data().get(off..off + size as usize)
+    let end = off.checked_add(size as usize)?;
+    ctx.data().get(off..end)
 }

@@ -1,6 +1,12 @@
 //! Shared low-level readers used by the RTTI / methods / interfaces
 //! modules. The returned slices borrow from the binary context's
 //! underlying byte buffer.
+//!
+//! Every offset arithmetic here uses [`usize::checked_add`] /
+//! [`usize::checked_sub`] so adversarial inputs (e.g. an enormous length
+//! field on disk) cannot overflow into a panic in debug builds or a
+//! wrap-around in release builds. The result is a clean `None`
+//! propagated up to the caller.
 
 use crate::formats::BinaryContext;
 
@@ -8,11 +14,13 @@ use crate::formats::BinaryContext;
 pub(crate) fn read_ptr(bytes: &[u8], off: usize, size: usize) -> Option<u64> {
     match size {
         4 => {
-            let slice = bytes.get(off..off + 4)?;
+            let end = off.checked_add(4)?;
+            let slice = bytes.get(off..end)?;
             Some(u32::from_le_bytes(slice.try_into().ok()?) as u64)
         }
         8 => {
-            let slice = bytes.get(off..off + 8)?;
+            let end = off.checked_add(8)?;
+            let slice = bytes.get(off..end)?;
             Some(u64::from_le_bytes(slice.try_into().ok()?))
         }
         _ => None,
@@ -22,14 +30,16 @@ pub(crate) fn read_ptr(bytes: &[u8], off: usize, size: usize) -> Option<u64> {
 /// Read an unsigned little-endian `u16` at a file offset.
 #[inline]
 pub(crate) fn read_u16(bytes: &[u8], off: usize) -> Option<u16> {
-    let slice = bytes.get(off..off + 2)?;
+    let end = off.checked_add(2)?;
+    let slice = bytes.get(off..end)?;
     Some(u16::from_le_bytes(slice.try_into().ok()?))
 }
 
 /// Read an unsigned little-endian `u32` at a file offset.
 #[inline]
 pub(crate) fn read_u32(bytes: &[u8], off: usize) -> Option<u32> {
-    let slice = bytes.get(off..off + 4)?;
+    let end = off.checked_add(4)?;
+    let slice = bytes.get(off..end)?;
     Some(u32::from_le_bytes(slice.try_into().ok()?))
 }
 
@@ -47,9 +57,10 @@ pub(crate) fn read_short_string_at_va<'a>(ctx: &BinaryContext<'a>, va: u64) -> O
 /// Read a short-string starting at `off` within `data`. Returns the body
 /// slice (no length byte).
 pub(crate) fn read_short_string_at_file(data: &[u8], off: usize) -> Option<&[u8]> {
-    let &len = data.get(off)?;
-    let len = len as usize;
-    data.get(off + 1..off + 1 + len)
+    let len = *data.get(off)? as usize;
+    let body_start = off.checked_add(1)?;
+    let body_end = body_start.checked_add(len)?;
+    data.get(body_start..body_end)
 }
 
 /// Read a pointer at `va`, then interpret the result as another VA. Used by

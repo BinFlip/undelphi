@@ -61,6 +61,32 @@
 //! - **Instance memory layout** — byte-by-byte reconstruction with
 //!   managed-field markers and gap-fill.
 //!
+//! ## Virtual addresses: code vs data, and RVA conversion
+//!
+//! Every `…_va` field this crate exposes is an **absolute virtual
+//! address** — the value that would appear in the loaded image. PE
+//! consumers operating in RVA space must subtract the image base.
+//!
+//! Fields fall into two categories:
+//!
+//! | Field | Kind |
+//! |-------|------|
+//! | [`MethodEntry::code_va`](crate::methods::MethodEntry::code_va) | code (function entry point) |
+//! | [`vtable::VirtualMethodEntry::code_va`](crate::vtable::VirtualMethodEntry::code_va) | code |
+//! | [`vmttables::DynamicSlot::handler_va`](crate::vmttables::DynamicSlot::handler_va) | code |
+//! | [`InterfaceEntry::getter_va`](crate::interfaces::InterfaceEntry::getter_va) | code |
+//! | [`InterfaceEntry::vtable_va`](crate::interfaces::InterfaceEntry::vtable_va) | data (pointer-array) |
+//! | [`extrtti::AttributeEntry::attr_ctor`](crate::extrtti::AttributeEntry::attr_ctor) | code |
+//! | [`extrtti::AttributeEntry::attr_type_ref`](crate::extrtti::AttributeEntry::attr_type_ref) | data (`PPTypeInfo`) |
+//! | [`Access::value`](crate::properties::Access::value) when `kind == AccessKind::Static` | code |
+//! | [`Access::value`](crate::properties::Access::value) when `kind == AccessKind::Virtual` | **VMT slot index** — *not* a VA. Resolve with [`Access::resolve`](crate::properties::Access::resolve) |
+//! | [`Class::vmt_va`](crate::classes::Class::vmt_va) | data (VMT base) |
+//! | [`vtable::VirtualMethodEntry::slot_va`](crate::vtable::VirtualMethodEntry::slot_va) | data (slot storage in VMT) |
+//! | [`Property::prop_type_ref`](crate::properties::Property::prop_type_ref) | data (`PPTypeInfo`) |
+//!
+//! For a complete enumeration of code entrypoints, see
+//! [`DelphiBinary::code_entrypoints`].
+//!
 //! ## Robustness contract
 //!
 //! Every parser in this crate treats its input as untrusted: parsers
@@ -77,7 +103,7 @@
 //! use undelphi::DelphiBinary;
 //!
 //! let bytes = std::fs::read("my_app.exe").unwrap();
-//! if let Some(bin) = DelphiBinary::parse(&bytes) {
+//! if let Ok(bin) = DelphiBinary::parse(&bytes) {
 //!     if let Some(info) = bin.compiler() {
 //!         println!("Compiler: {:?} v{:?} ({:?} {:?})", info.compiler, info.version, info.os, info.arch);
 //!     }
@@ -91,30 +117,38 @@
 //! }
 //! ```
 
-#![warn(
+// This crate is used for malware analysis: every input byte is
+// adversarial and must not be allowed to panic the parser.
+#![deny(
     missing_docs,
-    missing_debug_implementations,
-    unreachable_pub,
-    rust_2018_idioms
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::arithmetic_side_effects,
+    clippy::indexing_slicing
 )]
-// We do NOT globally deny panic-prone clippy lints because they are noisy
-// on safe bounded arithmetic (`+ 1` in well-behaved loops, slicing after
-// a length check, etc.). Instead we hold library code to a manually-audited
-// no-panic-on-malformed-input contract that is exercised by the fuzz-like
-// regression tests in `tests/malformed.rs` — the `unwrap_used` and
-// `expect_used` lints below catch the two easiest-to-regress patterns.
-#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::arithmetic_side_effects,
+        clippy::indexing_slicing
+    )
+)]
 
 pub mod blobs;
 pub mod classes;
 pub mod detection;
 pub mod dfm;
 pub mod dvclal;
+pub mod entrypoints;
 pub mod extrtti;
 pub mod fields;
 pub mod formats;
 pub mod fpcresources;
+pub mod initfini;
 pub mod interfaces;
 pub mod layout;
 pub mod limits;
@@ -131,24 +165,72 @@ pub mod xref;
 
 pub(crate) mod util;
 
-use std::cell::OnceCell;
-use std::collections::HashSet;
+/// Emit a warning event when the `tracing` feature is enabled. No-op
+/// otherwise — keeps `tracing` strictly opt-in.
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __undelphi_trace_warn {
+    ($($arg:tt)*) => {
+        #[cfg(feature = "tracing")]
+        {
+            ::tracing::warn!($($arg)*);
+        }
+    };
+}
+
+use std::{collections::HashSet, fmt, sync::OnceLock};
 
 use crate::{
     blobs::{EmbeddedBlob, catalog as catalog_blobs},
     classes::{Class, ClassSet},
-    detection::{Compiler, CompilerInfo, Confidence, DetectionReport},
-    dfm::{DfmObject, parse as parse_dfm},
+    detection::{Compiler, CompilerInfo, Confidence, DetectionReport, TargetArch, TargetOs},
+    dfm::DfmObject,
     dvclal::Edition,
-    fields::{Field, iter_fields},
+    fields::Field,
     formats::{BinaryContext, BinaryFormat},
-    interfaces::{InterfaceEntry, iter_interfaces},
-    methods::{MethodEntry, iter_methods},
+    interfaces::InterfaceEntry,
+    methods::MethodEntry,
     packageinfo::PackageInfo,
-    properties::{Property, iter_properties},
+    properties::Property,
     resources::{find_rcdata, iter_rcdata_named},
-    rtti::{TkClassInfo, tkclass_from_vmt},
+    rtti::TkClassInfo,
 };
+
+/// Why [`DelphiBinary::parse`] failed.
+///
+/// Use this to decide log severity. `NotRecognized` is the common, quiet
+/// case — non-Delphi binaries land here. The other variants represent
+/// actually broken or unfamiliar input and are usually worth surfacing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ParseError {
+    /// Container parsed cleanly but no Delphi / C++Builder / FPC markers
+    /// were found. Expected on non-Delphi binaries; safe to ignore.
+    NotRecognized,
+    /// A recognised container magic (`MZ`, `\x7fELF`, Mach-O) is present
+    /// but goblin failed to walk the headers. Either the file is truncated
+    /// or the headers are deliberately malformed (some packers do this).
+    TruncatedContainer,
+    /// The input does not start with any container magic this crate knows
+    /// how to handle. Heuristic scans still ran but found nothing.
+    UnrecognizedFormat,
+}
+
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ParseError::NotRecognized => f.write_str("no Delphi / C++Builder / FPC markers found"),
+            ParseError::TruncatedContainer => {
+                f.write_str("container magic present but headers could not be parsed")
+            }
+            ParseError::UnrecognizedFormat => {
+                f.write_str("input has no recognised container magic")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ParseError {}
 
 /// A parsed Delphi / C++Builder / FPC binary.
 ///
@@ -168,12 +250,17 @@ pub struct DelphiBinary<'a> {
     /// first call to [`DelphiBinary::forms`] and reused by every later call
     /// (including the xref views, which would otherwise re-parse every form
     /// on every access).
-    forms_cache: OnceCell<Vec<(String, DfmObject<'a>)>>,
+    forms_cache: OnceLock<Vec<(String, DfmObject<'a>)>>,
+    /// Lazy-initialised binary-wide index of FPC `tkInterface` records,
+    /// keyed by GUID. Built on first call to
+    /// [`DelphiBinary::interface_methods`] and reused thereafter.
+    /// Empty on Delphi binaries (Delphi's classic `tkInterface` doesn't
+    /// carry the method-name table this index is for).
+    tkinterface_index: OnceLock<std::collections::HashMap<interfaces::Guid, u64>>,
 }
 
 impl<'a> DelphiBinary<'a> {
-    /// Analyze a byte slice. Returns `None` if no Delphi/FPC indicators are
-    /// found.
+    /// Analyze a byte slice.
     ///
     /// Runs detection in order of decreasing reliability:
     ///
@@ -182,8 +269,18 @@ impl<'a> DelphiBinary<'a> {
     /// 3. `PACKAGEINFO` resource lookup (High).
     /// 4. `TPF0` occurrence count (Medium).
     ///
-    /// A match at any level above `Low` produces `Some`. No detection → `None`.
-    pub fn parse(data: &'a [u8]) -> Option<Self> {
+    /// A match at any level above `Low` succeeds. Otherwise the call returns
+    /// a [`ParseError`] describing why detection failed:
+    ///
+    /// - [`ParseError::NotRecognized`] — the input is a valid container but
+    ///   carries no Delphi/FPC markers. Expected on non-Delphi binaries; safe
+    ///   to swallow without logging.
+    /// - [`ParseError::TruncatedContainer`] — a recognised container magic is
+    ///   present but goblin failed to walk the headers (truncated PE / ELF /
+    ///   Mach-O). Worth logging.
+    /// - [`ParseError::UnrecognizedFormat`] — the input has no known
+    ///   container magic at all. Worth logging if you expected an executable.
+    pub fn parse(data: &'a [u8]) -> Result<Self, ParseError> {
         let ctx = BinaryContext::new(data);
         let DetectionReport {
             mut confidence,
@@ -211,10 +308,16 @@ impl<'a> DelphiBinary<'a> {
         }
 
         if confidence == Confidence::None {
-            return None;
+            return Err(if ctx.format() == BinaryFormat::Unknown {
+                ParseError::UnrecognizedFormat
+            } else if !ctx.container_parsed() {
+                ParseError::TruncatedContainer
+            } else {
+                ParseError::NotRecognized
+            });
         }
 
-        Some(Self {
+        Ok(Self {
             ctx,
             confidence,
             compiler,
@@ -222,7 +325,8 @@ impl<'a> DelphiBinary<'a> {
             package_info,
             tpf0_count,
             classes,
-            forms_cache: OnceCell::new(),
+            forms_cache: OnceLock::new(),
+            tkinterface_index: OnceLock::new(),
         })
     }
 
@@ -248,6 +352,31 @@ impl<'a> DelphiBinary<'a> {
     #[inline]
     pub fn compiler_kind(&self) -> Option<Compiler> {
         self.compiler.as_ref().map(|c| c.compiler)
+    }
+
+    /// Target operating system. Prefers the value from the parsed compiler
+    /// build-string when available; otherwise falls back to container-level
+    /// inference (PE → Windows, Mach-O → Darwin, ELF → Linux).
+    pub fn target_os(&self) -> TargetOs {
+        if let Some(info) = &self.compiler
+            && info.os != TargetOs::Unknown
+        {
+            return info.os;
+        }
+        self.ctx.target_os()
+    }
+
+    /// Target architecture. Prefers the value from the parsed compiler
+    /// build-string when available; otherwise falls back to the
+    /// container-level machine code (PE `Machine`, ELF `e_machine`,
+    /// Mach-O `cputype`).
+    pub fn target_arch(&self) -> TargetArch {
+        if let Some(info) = &self.compiler
+            && info.arch != TargetArch::Unknown
+        {
+            return info.arch;
+        }
+        self.ctx.target_arch()
     }
 
     /// Delphi / C++Builder SKU (Personal / Professional / Enterprise), if the
@@ -282,52 +411,155 @@ impl<'a> DelphiBinary<'a> {
     /// without `{$M+}` equivalent), when the record cannot be parsed, or
     /// when the Kind byte is not `tkClass`.
     pub fn tkclass(&self, class: &Class<'a>) -> Option<TkClassInfo<'a>> {
-        tkclass_from_vmt(&self.ctx, &class.vmt)
+        TkClassInfo::from_vmt(&self.ctx, &class.vmt)
     }
 
     /// Unit name of the class (the Pascal unit the class was declared in),
     /// extracted from the `tkClass` RTTI. Returns `None` when no RTTI.
     pub fn unit_name(&self, class: &Class<'a>) -> Option<&'a str> {
-        self.tkclass(class).and_then(|c| c.unit_name_str())
+        self.tkclass(class).map(|c| c.unit_name())
     }
 
     /// Decode the class's published-method table.
     ///
     /// Returns an empty vector when the class has no method table.
     pub fn methods(&self, class: &Class<'a>) -> Vec<MethodEntry<'a>> {
-        iter_methods(&self.ctx, &class.vmt)
+        MethodEntry::iter(&self.ctx, &class.vmt)
     }
 
     /// Decode the class's interface table.
     pub fn interfaces(&self, class: &Class<'a>) -> Vec<InterfaceEntry<'a>> {
-        iter_interfaces(&self.ctx, &class.vmt)
+        InterfaceEntry::iter(&self.ctx, &class.vmt)
+    }
+
+    /// Iterate the method-pointer array referenced by an
+    /// [`InterfaceEntry::vtable_va`], populating method names from
+    /// the matching `tkInterface` RTTI when reachable.
+    ///
+    /// Slot count + code VAs come from a vtable walk that terminates
+    /// at the first slot that doesn't contain a plausible code VA
+    /// (zero, unmapped, or outside the binary's `.text` / `__text` /
+    /// `CODE` section) — works on both Delphi and FPC, including
+    /// stripped binaries.
+    ///
+    /// Method *names* come from a binary-wide index of FPC
+    /// `tkInterface` RTTI records keyed by GUID, built lazily on
+    /// first call. Delphi's classic `tkInterface` records don't
+    /// carry method names, so on Delphi binaries the `name` field
+    /// stays `None`.
+    pub fn interface_methods(
+        &self,
+        entry: &InterfaceEntry<'a>,
+    ) -> Vec<interfaces::InterfaceMethod<'a>> {
+        let ptr_size = self.ctx.pointer_size().unwrap_or(
+            self.classes
+                .iter()
+                .next()
+                .map_or(0, |c| c.pointer_size() as usize),
+        );
+        if ptr_size == 0 {
+            return Vec::new();
+        }
+        let mut methods = interfaces::InterfaceMethod::iter(&self.ctx, entry, ptr_size);
+        // Try to populate names from the FPC tkInterface index.
+        let index = self
+            .tkinterface_index
+            .get_or_init(|| rtti::scan_fpc_tkinterface_index(&self.ctx));
+        if let Some(&tkintf_va) = index.get(&entry.guid)
+            && let Some(table) = rtti::IntfMethodTable::from_tkinterface(&self.ctx, tkintf_va)
+        {
+            for rtti_entry in table.entries() {
+                if let Some(m) = methods.get_mut(rtti_entry.slot() as usize) {
+                    m.name = Some(rtti_entry.name());
+                }
+            }
+        }
+        methods
     }
 
     /// Decode the virtual-method-pointer array that follows the class's
     /// VMT header. One entry per user-declared (or inherited) virtual
     /// method slot.
     pub fn virtual_methods(&self, class: &Class<'a>) -> Vec<vtable::VirtualMethodEntry> {
-        let bound = vtable::upper_bound_for(&self.classes, &class.vmt);
-        vtable::iter_virtual_methods(&self.ctx, &class.vmt, bound)
+        let bound = vtable::VirtualMethodEntry::upper_bound_for(&self.classes, &class.vmt);
+        vtable::VirtualMethodEntry::iter(&self.ctx, &class.vmt, bound)
     }
 
     /// Decode the class's init (managed-fields) table — the list of
     /// instance offsets the runtime needs to refcount-manage.
     pub fn init_table(&self, class: &Class<'a>) -> Option<rtti::RecordInfo<'a>> {
-        vmttables::decode_init_table(&self.ctx, &class.vmt)
+        rtti::RecordInfo::from_init_table(&self.ctx, &class.vmt)
     }
 
     /// Decode the class's dynamic-dispatch table (message handlers +
     /// `dynamic` method slots).
     pub fn dynamic_slots(&self, class: &Class<'a>) -> Vec<vmttables::DynamicSlot> {
-        vmttables::decode_dynamic_table(&self.ctx, &class.vmt)
+        vmttables::DynamicSlot::iter(&self.ctx, &class.vmt)
     }
 
     /// Walk the extended-RTTI property table for `class` — includes
     /// non-published members (private / protected / public) with their
     /// visibility flags and attached attribute bytes.
     pub fn extended_properties(&self, class: &Class<'a>) -> Vec<extrtti::ExtendedProperty<'a>> {
-        extrtti::iter_extended_properties(&self.ctx, class)
+        extrtti::ExtendedProperty::iter(&self.ctx, class)
+    }
+
+    /// Walk the FPC `INITFINAL` table to recover per-unit
+    /// `initialization` / `finalization` procedure VAs.
+    ///
+    /// Located via symbol lookup (`INITFINAL` / `_INITFINAL` /
+    /// `FPC_INITFINAL` in ELF symtab, Mach-O `LC_SYMTAB`, or PE export
+    /// table) with a heuristic shape scan over data sections as a
+    /// fallback for stripped builds. See [`initfini`] for layout
+    /// details.
+    ///
+    /// Delphi binaries return an empty vector: the Delphi RTL inlines
+    /// per-unit init/finalize calls directly into the entry-point
+    /// startup sequence rather than emitting a discoverable table, so
+    /// recovering them statically would require disassembly of the
+    /// program entry point — outside this crate's scope. Delphi
+    /// consumers that need the unit *list* (without VAs) can read it
+    /// from [`DelphiBinary::package_info`].
+    pub fn unit_init_procs(&self) -> Vec<initfini::UnitInitProc<'a>> {
+        initfini::iter_unit_init_procs(&self.ctx)
+    }
+
+    /// Aggregate every code address this crate can confidently label —
+    /// published methods, virtual-method slots, dynamic-message handlers,
+    /// interface getters and methods, property accessors (with
+    /// `AccessKind::Virtual` slots resolved to code VAs), attribute
+    /// constructors, and unit init / finalize procedures.
+    ///
+    /// Duplicates are emitted across [`entrypoints::EntrypointKind`]
+    /// variants when the same VA is reached via more than one path; the
+    /// caller dedups by their preferred priority.
+    ///
+    /// See the
+    /// [`entrypoints`] module docs for kind semantics. This is the
+    /// one-stop helper meant to replace the ~100 LoC of glue every
+    /// disassembler-driving consumer would otherwise write.
+    pub fn code_entrypoints(&'a self) -> Vec<entrypoints::CodeEntrypoint<'a>> {
+        entrypoints::collect(self)
+    }
+
+    /// Decode the class-level attribute table for `class`, when one is
+    /// present.
+    ///
+    /// Walks past the classic `TPropData` and the extended-property
+    /// block to find the `AttrData` trailer, then decodes its packed
+    /// attribute entries. The walker is layout-driven, not
+    /// flavor-gated: it returns whatever the trailer actually contains.
+    /// In practice that means:
+    ///
+    /// - Modern Delphi (XE3+) classes that declare `[Attribute]`
+    ///   annotations: returns the decoded entries.
+    /// - Older Delphi, classes compiled with `{$RTTI EXPLICIT}`
+    ///   suppression, or FPC < 3.3 (no `PROVIDE_ATTR_TABLE`): returns
+    ///   an empty vector — the trailer either isn't there or has a
+    ///   shape we don't recognise.
+    /// - Classes with no attributes: returns an empty vector.
+    pub fn class_attributes(&self, class: &Class<'a>) -> Vec<extrtti::AttributeEntry<'a>> {
+        extrtti::AttributeEntry::iter_class(&self.ctx, class)
     }
 
     /// Look up a published method by name on `class`, walking the
@@ -337,7 +569,7 @@ impl<'a> DelphiBinary<'a> {
         let mut walker: Option<&Class<'a>> = Some(class);
         while let Some(c) = walker {
             for m in self.methods(c) {
-                if m.name_str().eq_ignore_ascii_case(method_name) {
+                if m.name().eq_ignore_ascii_case(method_name) {
                     return Some(m.code_va);
                 }
             }
@@ -352,7 +584,7 @@ impl<'a> DelphiBinary<'a> {
     /// TypeData `UnitName`. Returns an empty vector when the class has no
     /// RTTI (stripped binary, or class compiled without `{$M+}`).
     pub fn properties(&self, class: &Class<'a>) -> Vec<Property<'a>> {
-        iter_properties(&self.ctx, &class.vmt)
+        Property::iter(&self.ctx, &class.vmt)
     }
 
     /// Resolve the declared type of a property from its `PropType` pointer.
@@ -365,7 +597,7 @@ impl<'a> DelphiBinary<'a> {
         class: &Class<'a>,
         prop: &Property<'a>,
     ) -> Option<rtti::TypeHeader<'a>> {
-        rtti::decode_type_header_from_pptr(
+        rtti::TypeHeader::from_pptr(
             &self.ctx,
             prop.prop_type_ref,
             class.vmt.pointer_size as usize,
@@ -376,7 +608,7 @@ impl<'a> DelphiBinary<'a> {
     /// Resolve the declared type of a field from its `TypeInfoPtr`.
     pub fn field_type(&self, class: &Class<'a>, field: &Field<'a>) -> Option<rtti::TypeHeader<'a>> {
         match field.type_ref {
-            fields::FieldTypeRef::TypeInfoPtr(pptr) => rtti::decode_type_header_from_pptr(
+            fields::FieldTypeRef::TypeInfoPtr(pptr) => rtti::TypeHeader::from_pptr(
                 &self.ctx,
                 pptr,
                 class.vmt.pointer_size as usize,
@@ -397,7 +629,7 @@ impl<'a> DelphiBinary<'a> {
             detection::Compiler::FreePascal => vmt::VmtFlavor::Fpc,
             _ => vmt::VmtFlavor::Delphi,
         };
-        rtti::decode_tkenum(&self.ctx, type_info_va, flavor)
+        rtti::EnumInfo::from_va(&self.ctx, type_info_va, flavor)
     }
 
     /// Pick the `VmtFlavor` matching this binary's toolchain.
@@ -416,8 +648,9 @@ impl<'a> DelphiBinary<'a> {
         prop: &Property<'a>,
     ) -> Option<rtti::TypeDetail<'a>> {
         let ptr_size = class.vmt.pointer_size as usize;
-        let type_info_va = rtti::deref_pptypeinfo(&self.ctx, prop.prop_type_ref, ptr_size)?;
-        rtti::decode_type_detail(&self.ctx, type_info_va, class.vmt.flavor)
+        let type_info_va =
+            rtti::TypeHeader::deref_pptypeinfo(&self.ctx, prop.prop_type_ref, ptr_size)?;
+        rtti::TypeDetail::from_va(&self.ctx, type_info_va, class.vmt.flavor)
     }
 
     /// Full per-Kind RTTI decode for the type referenced by a field.
@@ -429,8 +662,8 @@ impl<'a> DelphiBinary<'a> {
         let ptr_size = class.vmt.pointer_size as usize;
         match field.type_ref {
             fields::FieldTypeRef::TypeInfoPtr(pptr) => {
-                let type_info_va = rtti::deref_pptypeinfo(&self.ctx, pptr, ptr_size)?;
-                rtti::decode_type_detail(&self.ctx, type_info_va, class.vmt.flavor)
+                let type_info_va = rtti::TypeHeader::deref_pptypeinfo(&self.ctx, pptr, ptr_size)?;
+                rtti::TypeDetail::from_va(&self.ctx, type_info_va, class.vmt.flavor)
             }
             fields::FieldTypeRef::TypeIndex(_) => None,
         }
@@ -441,7 +674,7 @@ impl<'a> DelphiBinary<'a> {
     /// Returns an empty vector when the class declares no published fields
     /// (many classes don't) or the table is malformed.
     pub fn fields(&self, class: &Class<'a>) -> Vec<Field<'a>> {
-        iter_fields(&self.ctx, &class.vmt)
+        Field::iter(&self.ctx, &class.vmt)
     }
 
     /// Decode every DFM / FMX / LFM / XFM form stream embedded as a
@@ -468,13 +701,13 @@ impl<'a> DelphiBinary<'a> {
 
         // 1. PE RCDATA.
         for (name, body) in iter_rcdata_named(&self.ctx) {
-            if body.data.len() < 4 {
+            let Some(magic) = body.data.get(..4) else {
+                continue;
+            };
+            if magic != dfm::TPF0_MAGIC && magic != dfm::TPF1_MAGIC {
                 continue;
             }
-            if &body.data[..4] != dfm::TPF0_MAGIC && &body.data[..4] != dfm::TPF1_MAGIC {
-                continue;
-            }
-            if let Some(obj) = parse_dfm(body.data)
+            if let Some(obj) = DfmObject::parse(body.data)
                 && seen_names.insert(name.clone())
             {
                 out.push((name, obj));
@@ -483,17 +716,17 @@ impl<'a> DelphiBinary<'a> {
 
         // 2. FPC tree.
         for r in fpcresources::iter_rcdata(&self.ctx) {
-            if r.data.len() < 4 {
+            let Some(magic) = r.data.get(..4) else {
                 continue;
-            }
-            if &r.data[..4] != dfm::TPF0_MAGIC && &r.data[..4] != dfm::TPF1_MAGIC {
+            };
+            if magic != dfm::TPF0_MAGIC && magic != dfm::TPF1_MAGIC {
                 continue;
             }
             let name = r
                 .name
                 .clone()
                 .unwrap_or_else(|| format!("#{}", r.name_id.unwrap_or(0)));
-            if let Some(obj) = parse_dfm(r.data)
+            if let Some(obj) = DfmObject::parse(r.data)
                 && seen_names.insert(name.clone())
             {
                 out.push((name, obj));
@@ -512,10 +745,11 @@ impl<'a> DelphiBinary<'a> {
     /// the blob bytes (borrowed from the input), and a magic-byte
     /// classification.
     ///
-    /// Allocates a `Vec<EmbeddedBlob<'a>>`. The blob payloads themselves
-    /// are not copied. Reads `forms()` (cached) — calling this repeatedly
-    /// only re-walks the parsed tree, never the binary.
-    pub fn blobs(&self) -> Vec<EmbeddedBlob<'a>> {
+    /// Allocates a `Vec<EmbeddedBlob>`. Each blob carries borrowed
+    /// references into the cached form tree (`component`, `property`),
+    /// so consumers can attach blobs to their owning components without
+    /// re-walking. The blob payloads themselves are not copied.
+    pub fn blobs(&self) -> Vec<EmbeddedBlob<'a, '_>> {
         catalog_blobs(self.forms())
     }
 
@@ -525,3 +759,8 @@ impl<'a> DelphiBinary<'a> {
         &self.ctx
     }
 }
+
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<DelphiBinary<'_>>();
+};

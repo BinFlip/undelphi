@@ -67,7 +67,7 @@ pub fn reconstruct<'a>(bin: &DelphiBinary<'a>, class: &Class<'a>) -> Vec<LayoutE
             r.managed_fields
                 .into_iter()
                 .map(|f| {
-                    let ty = f.field_type.map(|h| h.name_str().to_owned());
+                    let ty = f.field_type.map(|h| h.name().to_owned());
                     (f.offset, ty)
                 })
                 .collect()
@@ -80,7 +80,7 @@ pub fn reconstruct<'a>(bin: &DelphiBinary<'a>, class: &Class<'a>) -> Vec<LayoutE
     for f in &named_fields {
         let type_name = bin
             .field_type(class, f)
-            .map(|h| h.name_str().to_owned())
+            .map(|h| h.name().to_owned())
             .or_else(|| match f.type_ref {
                 FieldTypeRef::TypeIndex(i) => Some(format!("<type-index {i}>")),
                 FieldTypeRef::TypeInfoPtr(p) => Some(format!("<typeinfo 0x{:x}>", p)),
@@ -89,7 +89,7 @@ pub fn reconstruct<'a>(bin: &DelphiBinary<'a>, class: &Class<'a>) -> Vec<LayoutE
         slots.insert(
             f.offset,
             LayoutKind::NamedField {
-                name: f.name_str().to_owned(),
+                name: f.name().to_owned(),
                 type_name,
                 managed,
             },
@@ -105,13 +105,15 @@ pub fn reconstruct<'a>(bin: &DelphiBinary<'a>, class: &Class<'a>) -> Vec<LayoutE
     }
 
     // Walk sorted slots, emitting Gap entries where consecutive slots don't
-    // touch.
+    // touch. Offsets are u32; `checked_sub` / `checked_add` keep us safe
+    // against malformed VMTs that report nonsensical offsets.
     let mut prev_end: u32 = 0;
     for (off, kind) in &slots {
         if *off > prev_end {
+            let gap_size = off.checked_sub(prev_end).unwrap_or(0);
             out.push(LayoutEntry {
                 offset: prev_end,
-                size: off - prev_end,
+                size: gap_size,
                 kind: LayoutKind::Gap,
             });
         }
@@ -130,12 +132,16 @@ pub fn reconstruct<'a>(bin: &DelphiBinary<'a>, class: &Class<'a>) -> Vec<LayoutE
             size,
             kind: kind.clone(),
         });
-        prev_end = off + size;
+        // Saturate at u32::MAX rather than panic — a slot whose
+        // offset+size would overflow is reported with a truncated
+        // `prev_end`, which is preferable to dropping the layout.
+        prev_end = off.saturating_add(size);
     }
     if prev_end < total {
+        let trail = total.saturating_sub(prev_end);
         out.push(LayoutEntry {
             offset: prev_end,
-            size: total - prev_end,
+            size: trail,
             kind: LayoutKind::Gap,
         });
     }

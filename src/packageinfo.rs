@@ -35,7 +35,7 @@
 //! - `HashCode` is a compiler-emitted check digit. We expose it but do not
 //!   verify it.
 
-use core::str;
+use std::str;
 
 /// Parsed PACKAGEINFO resource. All strings borrow from the resource
 /// body provided to [`parse`].
@@ -124,13 +124,14 @@ impl<'a> Cursor<'a> {
 
     fn read_u8(&mut self) -> Option<u8> {
         let b = *self.buf.get(self.pos)?;
-        self.pos += 1;
+        self.pos = self.pos.checked_add(1)?;
         Some(b)
     }
 
     fn read_u32(&mut self) -> Option<u32> {
-        let bytes = self.buf.get(self.pos..self.pos + 4)?;
-        self.pos += 4;
+        let end = self.pos.checked_add(4)?;
+        let bytes = self.buf.get(self.pos..end)?;
+        self.pos = end;
         Some(u32::from_le_bytes(bytes.try_into().ok()?))
     }
 
@@ -139,9 +140,9 @@ impl<'a> Cursor<'a> {
         let start = self.pos;
         let tail = self.buf.get(start..)?;
         let rel = tail.iter().position(|&b| b == 0)?;
-        let end = start + rel;
+        let end = start.checked_add(rel)?;
         let bytes = self.buf.get(start..end)?;
-        self.pos = end + 1;
+        self.pos = end.checked_add(1)?;
         str::from_utf8(bytes).ok()
     }
 }

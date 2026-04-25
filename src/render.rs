@@ -57,11 +57,14 @@ pub fn render_value(value: &DfmValue<'_>, detail: Option<&TypeDetail<'_>>) -> St
 /// Produce just an enumeration value name for an ordinal, or fall back to
 /// a numeric rendering if out of range.
 pub fn render_enum_ordinal(i: i32, info: &EnumInfo<'_>) -> String {
-    if i >= info.min && i <= info.max {
-        let idx = (i - info.min) as usize;
-        if let Some(name) = info.values.get(idx) {
-            return String::from_utf8_lossy(name).into_owned();
-        }
+    if i >= info.min
+        && i <= info.max
+        && let Some(idx) = i
+            .checked_sub(info.min)
+            .and_then(|n| usize::try_from(n).ok())
+        && let Some(name) = info.values.get(idx)
+    {
+        return String::from_utf8_lossy(name).into_owned();
     }
     format!("{} (out-of-range for {}..{})", i, info.min, info.max)
 }
@@ -69,12 +72,21 @@ pub fn render_enum_ordinal(i: i32, info: &EnumInfo<'_>) -> String {
 /// Render a set value whose element enumeration has already been decoded.
 pub fn render_set_mask_with_enum(mask: u32, enum_info: &EnumInfo<'_>) -> String {
     let mut names = Vec::new();
-    for ord in 0..=31 {
-        if (mask >> ord) & 1 == 1 && ord >= enum_info.min && ord <= enum_info.max {
-            let idx = (ord - enum_info.min) as usize;
-            if let Some(n) = enum_info.values.get(idx) {
-                names.push(String::from_utf8_lossy(n).into_owned());
-            }
+    for ord in 0i32..=31 {
+        if (mask.wrapping_shr(ord as u32)) & 1 != 1 {
+            continue;
+        }
+        if ord < enum_info.min || ord > enum_info.max {
+            continue;
+        }
+        let Some(idx) = ord
+            .checked_sub(enum_info.min)
+            .and_then(|n| usize::try_from(n).ok())
+        else {
+            continue;
+        };
+        if let Some(n) = enum_info.values.get(idx) {
+            names.push(String::from_utf8_lossy(n).into_owned());
         }
     }
     if names.is_empty() {
@@ -86,7 +98,7 @@ pub fn render_set_mask_with_enum(mask: u32, enum_info: &EnumInfo<'_>) -> String 
 
 /// Render the type portion of a property (e.g. `TCaption [UString]`).
 pub fn render_type_label(header: &TypeHeader<'_>) -> String {
-    format!("{} [{:?}]", header.name_str(), header.kind)
+    format!("{} [{:?}]", header.name(), header.kind)
 }
 
 fn default_render(v: &DfmValue<'_>) -> String {
@@ -103,7 +115,12 @@ fn default_render(v: &DfmValue<'_>) -> String {
         DfmValue::Currency(c) => format!("{:.4}$", (*c as f64) / 10_000.0),
         DfmValue::String(s) => format!("{:?}", String::from_utf8_lossy(s)),
         DfmValue::Utf16(b) => {
-            let iter = (0..b.len() / 2).map(|i| u16::from_le_bytes([b[i * 2], b[i * 2 + 1]]));
+            // chunks_exact(2) drops a trailing odd byte. Treat each
+            // pair as a fixed-size array to keep the slicing lint
+            // happy; the conversion is infallible.
+            let iter = b
+                .chunks_exact(2)
+                .filter_map(|c| <[u8; 2]>::try_from(c).ok().map(u16::from_le_bytes));
             let decoded: String = char::decode_utf16(iter).filter_map(Result::ok).collect();
             format!("{:?} (utf-16, {} bytes)", decoded, b.len())
         }

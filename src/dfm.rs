@@ -40,13 +40,25 @@
 //! never get copied — the parser only allocates the result `Vec`s and
 //! the recursive `DfmObject` tree itself.
 
-use core::str;
+use std::{borrow::Cow, str};
 
 /// TPF0 signature (first four bytes of every binary DFM/FMX/LFM/XFM stream).
 pub const TPF0_MAGIC: &[u8; 4] = b"TPF0";
 
 /// TPF1 — newer variant carrying unit-qualified class names (`UnitName.ClassName`).
 pub const TPF1_MAGIC: &[u8; 4] = b"TPF1";
+
+/// Stream-level form variant. Does *not* identify the toolchain that
+/// produced the form (Delphi vs Lazarus vs Kylix) — that needs the
+/// compiler family from [`crate::DelphiBinary::compiler_kind`]. Captures
+/// only the magic header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FormFlavor {
+    /// `TPF0` — class names are bare (e.g. `TButton`).
+    Tpf0,
+    /// `TPF1` — class names are unit-qualified (e.g. `Vcl.StdCtrls.TButton`).
+    Tpf1,
+}
 
 /// Binary stream-filer value types — verbatim from FPC
 /// `rtl/objpas/classes/classesh.inc:1690-1693`.
@@ -164,16 +176,19 @@ impl FilerFlags {
 /// A DFM object (form, frame, control, data-module, or nested component).
 #[derive(Debug, Clone)]
 pub struct DfmObject<'a> {
+    /// Stream variant the object was decoded from. The root form's
+    /// flavour propagates to every child.
+    pub flavor: FormFlavor,
     /// Filer flags from the component prefix, if any.
     pub flags: FilerFlags,
     /// Optional child position integer when `flags.child_pos` is set.
     pub child_pos: Option<i32>,
     /// Class name without any `.`-prefix unit qualification (e.g. `TButton`).
-    pub class_name: &'a [u8],
+    pub(crate) class_name: &'a [u8],
     /// Optional unit-name prefix if the file is TPF1 (e.g. `Vcl.StdCtrls`).
-    pub unit_name: Option<&'a [u8]>,
+    pub(crate) unit_name: Option<&'a [u8]>,
     /// Instance name (e.g. `Button1`). May be empty.
-    pub object_name: &'a [u8],
+    pub(crate) object_name: &'a [u8],
     /// Published properties in declaration order.
     pub properties: Vec<DfmProperty<'a>>,
     /// Nested child components in declaration order.
@@ -181,25 +196,94 @@ pub struct DfmObject<'a> {
 }
 
 impl<'a> DfmObject<'a> {
-    /// Class name as `&str` (falls back to `"<non-ascii>"` for odd bytes).
-    pub fn class_name_str(&self) -> &'a str {
+    /// Class name without any `.`-prefix unit qualification (e.g.
+    /// `TButton`), as `&str`. Lossily decoded; non-UTF-8 falls back to
+    /// `"<non-ascii>"`.
+    #[inline]
+    pub fn class_name(&self) -> &'a str {
         str::from_utf8(self.class_name).unwrap_or("<non-ascii>")
     }
-    /// Instance name as `&str`.
-    pub fn object_name_str(&self) -> &'a str {
+    /// Raw class-name bytes.
+    #[inline]
+    pub fn class_name_bytes(&self) -> &'a [u8] {
+        self.class_name
+    }
+    /// Instance name (e.g. `Button1`) as `&str`, may be empty.
+    #[inline]
+    pub fn object_name(&self) -> &'a str {
         str::from_utf8(self.object_name).unwrap_or("<non-ascii>")
+    }
+    /// Raw instance-name bytes.
+    #[inline]
+    pub fn object_name_bytes(&self) -> &'a [u8] {
+        self.object_name
+    }
+    /// Optional unit-name prefix when the file is TPF1 (e.g.
+    /// `Vcl.StdCtrls`), as `&str`.
+    #[inline]
+    pub fn unit_name(&self) -> Option<&'a str> {
+        self.unit_name
+            .map(|n| str::from_utf8(n).unwrap_or("<non-ascii>"))
+    }
+    /// Raw unit-name bytes.
+    #[inline]
+    pub fn unit_name_bytes(&self) -> Option<&'a [u8]> {
+        self.unit_name
     }
     /// Total component count in this sub-tree (including the root).
     pub fn component_count(&self) -> usize {
-        1 + self
+        let children_total: usize = self
             .children
             .iter()
             .map(DfmObject::component_count)
-            .sum::<usize>()
+            .fold(0usize, |a, b| a.saturating_add(b));
+        children_total.saturating_add(1)
     }
     /// Depth-first iterator over every descendant including self.
     pub fn walk(&'a self) -> DfmWalk<'a> {
         DfmWalk { stack: vec![self] }
+    }
+
+    /// Depth-first walk yielding `(dotted_path, &DfmObject)`. The root
+    /// node's path equals its instance name (or class name when
+    /// unnamed); each child appends `.{object_name|class_name}`.
+    ///
+    /// The path is freshly built per yield, so callers that don't need it
+    /// should prefer [`DfmObject::walk`].
+    pub fn walk_with_path(&'a self) -> DfmWalkWithPath<'a> {
+        let root_label = self.path_label();
+        DfmWalkWithPath {
+            stack: vec![(root_label, self)],
+        }
+    }
+
+    fn path_label(&self) -> String {
+        let name = self.object_name();
+        if name.is_empty() {
+            self.class_name().to_owned()
+        } else {
+            name.to_owned()
+        }
+    }
+}
+
+/// Depth-first walker yielding `(path, &DfmObject)` pairs. See
+/// [`DfmObject::walk_with_path`].
+#[derive(Debug)]
+pub struct DfmWalkWithPath<'a> {
+    stack: Vec<(String, &'a DfmObject<'a>)>,
+}
+
+impl<'a> Iterator for DfmWalkWithPath<'a> {
+    type Item = (String, &'a DfmObject<'a>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (path, obj) = self.stack.pop()?;
+        for child in obj.children.iter().rev() {
+            let child_path = format!("{}.{}", path, child.path_label());
+            self.stack.push((child_path, child));
+        }
+        Some((path, obj))
     }
 }
 
@@ -207,15 +291,21 @@ impl<'a> DfmObject<'a> {
 #[derive(Debug, Clone)]
 pub struct DfmProperty<'a> {
     /// Property name (e.g. `Caption`).
-    pub name: &'a [u8],
+    pub(crate) name: &'a [u8],
     /// Decoded value.
     pub value: DfmValue<'a>,
 }
 
 impl<'a> DfmProperty<'a> {
-    /// Name as `&str`.
-    pub fn name_str(&self) -> &'a str {
+    /// Property name (e.g. `Caption`) as `&str`, lossily decoded.
+    #[inline]
+    pub fn name(&self) -> &'a str {
         str::from_utf8(self.name).unwrap_or("<non-ascii>")
+    }
+    /// Raw property name bytes.
+    #[inline]
+    pub fn name_bytes(&self) -> &'a [u8] {
+        self.name
     }
 }
 
@@ -266,6 +356,84 @@ pub enum DfmValue<'a> {
     },
 }
 
+impl<'a> DfmValue<'a> {
+    /// Displayable text, for the text-ish variants. Returns:
+    ///
+    /// - `Some(Cow::Borrowed(_))` for [`DfmValue::String`] (treated as
+    ///   UTF-8 / ASCII; non-UTF-8 falls back to `String::from_utf8_lossy`).
+    /// - `Some(Cow::Owned(_))` for [`DfmValue::Utf16`] (raw UTF-16LE
+    ///   transcoded to a freshly-allocated `String`; an odd byte length
+    ///   drops the trailing byte).
+    /// - `None` for every other variant.
+    pub fn as_text(&self) -> Option<Cow<'_, str>> {
+        match self {
+            DfmValue::String(b) => Some(String::from_utf8_lossy(b)),
+            DfmValue::Utf16(b) => {
+                let units: Vec<u16> = b
+                    .chunks_exact(2)
+                    .filter_map(|c| <[u8; 2]>::try_from(c).ok().map(u16::from_le_bytes))
+                    .collect();
+                Some(Cow::Owned(String::from_utf16_lossy(&units)))
+            }
+            _ => None,
+        }
+    }
+
+    /// Decode the 10-byte Intel 80-bit extended-precision float
+    /// ([`DfmValue::Extended`]) to `f64`. Returns `None` for every other
+    /// variant. Lossy: precision is reduced from 64 mantissa bits to 52,
+    /// and exponents that overflow `f64` saturate to `±inf`.
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            DfmValue::Extended(bytes) => Some(extended_to_f64(*bytes)),
+            DfmValue::Single(v) => Some(*v as f64),
+            DfmValue::Double(v) => Some(*v),
+            _ => None,
+        }
+    }
+}
+
+/// Decode an Intel 80-bit extended-precision float (10 bytes,
+/// little-endian: 64-bit mantissa + 16-bit sign-and-exponent) into a
+/// best-effort `f64`. Lossy.
+///
+/// Layout: bytes 0..8 are the mantissa (with the integer bit explicit at
+/// position 63 — *not* an implicit-bit format like `f64`). Bytes 8..10
+/// hold the 15-bit biased exponent (bias 16383) plus a sign bit.
+fn extended_to_f64(b: [u8; 10]) -> f64 {
+    let mantissa = u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
+    let se = u16::from_le_bytes([b[8], b[9]]);
+    let sign = (se >> 15) & 1;
+    let exp_x = (se & 0x7fff) as i32;
+
+    if exp_x == 0 && mantissa == 0 {
+        // Signed zero.
+        return if sign == 1 { -0.0 } else { 0.0 };
+    }
+    if exp_x == 0x7fff {
+        // Inf / NaN. The sign of NaN is preserved.
+        return if mantissa & 0x7fff_ffff_ffff_ffff == 0 {
+            if sign == 1 {
+                f64::NEG_INFINITY
+            } else {
+                f64::INFINITY
+            }
+        } else {
+            f64::NAN
+        };
+    }
+
+    // Unbiased exponent. The 80-bit format has bias 16383; f64 has bias
+    // 1023. The leading integer bit of the mantissa is explicit, so the
+    // 64-bit mantissa already includes the integer-1 bit at position 63.
+    let unbiased = exp_x.saturating_sub(16383);
+    // Scale the 64-bit mantissa (treated as Q1.63) to f64. Each bit below
+    // the leading 1 is 2^-i. Multiplying by 2^unbiased recovers the value.
+    let mant_f = (mantissa as f64) / (1u64 << 63) as f64;
+    let value = mant_f * 2f64.powi(unbiased);
+    if sign == 1 { -value } else { value }
+}
+
 /// Depth-first walker over a parsed DFM tree.
 #[derive(Debug)]
 pub struct DfmWalk<'a> {
@@ -285,31 +453,41 @@ impl<'a> Iterator for DfmWalk<'a> {
     }
 }
 
-/// Parse a TPF0 / TPF1 stream.
-///
-/// Returns the root object when the stream parses cleanly. Returns `None`
-/// for malformed streams (truncation, unexpected tag byte in a structural
-/// slot). Stream versions other than TPF0/TPF1 return `None`.
-pub fn parse(stream: &[u8]) -> Option<DfmObject<'_>> {
-    if stream.len() < 4 {
-        return None;
+impl<'a> DfmObject<'a> {
+    /// Parse a TPF0 / TPF1 stream.
+    ///
+    /// Returns the root object when the stream parses cleanly.
+    /// Returns `None` for malformed streams (truncation, unexpected
+    /// tag byte in a structural slot). Stream versions other than
+    /// TPF0 / TPF1 return `None`.
+    pub fn parse(stream: &'a [u8]) -> Option<Self> {
+        let magic = stream.get(..4)?;
+        let version_is_1 = if magic == TPF0_MAGIC {
+            false
+        } else if magic == TPF1_MAGIC {
+            true
+        } else {
+            return None;
+        };
+        let mut cur = Cursor::new(stream, 4);
+        let parsed = read_object(&mut cur, version_is_1);
+        if parsed.is_none() {
+            crate::__undelphi_trace_warn!(
+                len = stream.len(),
+                tpf1 = version_is_1,
+                "DfmObject::parse: stream did not produce a root object"
+            );
+        }
+        parsed
     }
-    let magic = &stream[..4];
-    let version_is_1 = match magic {
-        b if b == TPF0_MAGIC => false,
-        b if b == TPF1_MAGIC => true,
-        _ => return None,
-    };
-    let mut cur = Cursor::new(stream, 4);
-    read_object(&mut cur, version_is_1)
-}
 
-/// Same as [`parse`], but accepts a stream missing the TPF0/TPF1 magic.
-/// Useful for feeding the parser data you've already identified by other
-/// means.
-pub fn parse_body(body: &[u8], version_is_1: bool) -> Option<DfmObject<'_>> {
-    let mut cur = Cursor::new(body, 0);
-    read_object(&mut cur, version_is_1)
+    /// Like [`Self::parse`], but accepts a stream missing the
+    /// TPF0 / TPF1 magic. Useful for feeding the parser data
+    /// you've already identified by other means.
+    pub fn parse_body(body: &'a [u8], version_is_1: bool) -> Option<Self> {
+        let mut cur = Cursor::new(body, 0);
+        read_object(&mut cur, version_is_1)
+    }
 }
 
 struct Cursor<'a> {
@@ -324,7 +502,7 @@ impl<'a> Cursor<'a> {
 
     fn read_u8(&mut self) -> Option<u8> {
         let b = *self.buf.get(self.pos)?;
-        self.pos += 1;
+        self.pos = self.pos.checked_add(1)?;
         Some(b)
     }
 
@@ -333,14 +511,16 @@ impl<'a> Cursor<'a> {
     }
 
     fn read_u16(&mut self) -> Option<u16> {
-        let slice = self.buf.get(self.pos..self.pos + 2)?;
-        self.pos += 2;
+        let end = self.pos.checked_add(2)?;
+        let slice = self.buf.get(self.pos..end)?;
+        self.pos = end;
         Some(u16::from_le_bytes(slice.try_into().ok()?))
     }
 
     fn read_u32(&mut self) -> Option<u32> {
-        let slice = self.buf.get(self.pos..self.pos + 4)?;
-        self.pos += 4;
+        let end = self.pos.checked_add(4)?;
+        let slice = self.buf.get(self.pos..end)?;
+        self.pos = end;
         Some(u32::from_le_bytes(slice.try_into().ok()?))
     }
 
@@ -349,14 +529,16 @@ impl<'a> Cursor<'a> {
     }
 
     fn read_i64(&mut self) -> Option<i64> {
-        let slice = self.buf.get(self.pos..self.pos + 8)?;
-        self.pos += 8;
+        let end = self.pos.checked_add(8)?;
+        let slice = self.buf.get(self.pos..end)?;
+        self.pos = end;
         Some(i64::from_le_bytes(slice.try_into().ok()?))
     }
 
     fn read_u64(&mut self) -> Option<u64> {
-        let slice = self.buf.get(self.pos..self.pos + 8)?;
-        self.pos += 8;
+        let end = self.pos.checked_add(8)?;
+        let slice = self.buf.get(self.pos..end)?;
+        self.pos = end;
         Some(u64::from_le_bytes(slice.try_into().ok()?))
     }
 
@@ -372,14 +554,16 @@ impl<'a> Cursor<'a> {
     /// length 0.
     fn read_short_string(&mut self) -> Option<&'a [u8]> {
         let len = self.read_u8()? as usize;
-        let slice = self.buf.get(self.pos..self.pos + len)?;
-        self.pos += len;
+        let end = self.pos.checked_add(len)?;
+        let slice = self.buf.get(self.pos..end)?;
+        self.pos = end;
         Some(slice)
     }
 
     fn read_bytes(&mut self, n: usize) -> Option<&'a [u8]> {
-        let slice = self.buf.get(self.pos..self.pos + n)?;
-        self.pos += n;
+        let end = self.pos.checked_add(n)?;
+        let slice = self.buf.get(self.pos..end)?;
+        self.pos = end;
         Some(slice)
     }
 }
@@ -412,12 +596,15 @@ fn read_object<'a>(cur: &mut Cursor<'a>, version_is_1: bool) -> Option<DfmObject
         // Empty class name marks end-of-children to the caller.
         return None;
     }
-    let (unit_name, class_name) =
-        if version_is_1 && let Some(pos) = raw_class.iter().rposition(|&b| b == b'.') {
-            (Some(&raw_class[..pos]), &raw_class[pos + 1..])
-        } else {
-            (None, raw_class)
-        };
+    let (unit_name, class_name) = if version_is_1
+        && let Some(pos) = raw_class.iter().rposition(|&b| b == b'.')
+        && let Some(unit) = raw_class.get(..pos)
+        && let Some(class) = pos.checked_add(1).and_then(|n| raw_class.get(n..))
+    {
+        (Some(unit), class)
+    } else {
+        (None, raw_class)
+    };
 
     let object_name = cur.read_short_string()?;
 
@@ -425,6 +612,11 @@ fn read_object<'a>(cur: &mut Cursor<'a>, version_is_1: bool) -> Option<DfmObject
     let children = read_children(cur, version_is_1)?;
 
     Some(DfmObject {
+        flavor: if version_is_1 {
+            FormFlavor::Tpf1
+        } else {
+            FormFlavor::Tpf0
+        },
         flags,
         child_pos,
         class_name,
@@ -590,6 +782,54 @@ fn read_value<'a>(cur: &mut Cursor<'a>) -> Option<DfmValue<'a>> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn extended_to_f64_zero() {
+        let bytes = [0u8; 10];
+        assert_eq!(extended_to_f64(bytes), 0.0);
+    }
+
+    #[test]
+    fn extended_to_f64_one() {
+        // 1.0 as 80-bit Intel extended:
+        //   sign=0, biased exp=0x3fff (16383), mantissa=0x8000_0000_0000_0000
+        let bytes = [0, 0, 0, 0, 0, 0, 0, 0x80, 0xff, 0x3f];
+        let v = extended_to_f64(bytes);
+        assert!((v - 1.0).abs() < 1e-15, "got {v}");
+    }
+
+    #[test]
+    fn extended_to_f64_neg_one() {
+        let bytes = [0, 0, 0, 0, 0, 0, 0, 0x80, 0xff, 0xbf];
+        let v = extended_to_f64(bytes);
+        assert!((v - -1.0).abs() < 1e-15, "got {v}");
+    }
+
+    #[test]
+    fn extended_to_f64_two() {
+        // 2.0 = 1.0 × 2^1, biased exp = 16384 = 0x4000.
+        let bytes = [0, 0, 0, 0, 0, 0, 0, 0x80, 0x00, 0x40];
+        let v = extended_to_f64(bytes);
+        assert!((v - 2.0).abs() < 1e-15, "got {v}");
+    }
+
+    #[test]
+    fn as_text_string() {
+        let v = DfmValue::String(b"hello");
+        assert_eq!(v.as_text().as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn as_text_utf16() {
+        let v = DfmValue::Utf16(b"h\0e\0l\0l\0o\0");
+        assert_eq!(v.as_text().as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn as_text_non_textual() {
+        assert!(DfmValue::Bool(true).as_text().is_none());
+        assert!(DfmValue::Int(42).as_text().is_none());
+    }
+
     fn build_min_stream() -> Vec<u8> {
         // Construct a minimal TPF0 stream:
         //   "TPF0" | TButton\0Button1\0 | Caption:vaString 'Hi' | end-of-props |
@@ -618,13 +858,13 @@ mod tests {
     #[test]
     fn parses_trivial_stream() {
         let stream = build_min_stream();
-        let obj = parse(&stream).expect("should parse");
+        let obj = DfmObject::parse(&stream).expect("should parse");
         assert_eq!(obj.class_name, b"TButton");
         assert_eq!(obj.object_name, b"Button1");
         assert_eq!(obj.properties.len(), 1);
         assert_eq!(obj.properties[0].name, b"Caption");
         match &obj.properties[0].value {
-            DfmValue::String(s) => assert_eq!(*s, b"Hi"),
+            DfmValue::String(s) => assert_eq!(*s, *b"Hi"),
             other => panic!("expected string value, got {other:?}"),
         }
         assert!(obj.children.is_empty());
@@ -672,7 +912,7 @@ mod tests {
         s.push(0); // end of root props
         s.push(0); // end of root children
 
-        let obj = parse(&s).expect("collection with vaList items should parse");
+        let obj = DfmObject::parse(&s).expect("collection with vaList items should parse");
         assert_eq!(obj.properties.len(), 1);
         assert_eq!(obj.properties[0].name, b"Panels");
         let items = match &obj.properties[0].value {
@@ -709,7 +949,7 @@ mod tests {
         s.push(0);
         s.push(0);
         s.push(0);
-        assert!(parse(&s).is_none());
+        assert!(DfmObject::parse(&s).is_none());
     }
 
     #[test]
@@ -739,20 +979,20 @@ mod tests {
 
         s.push(0); // end of root children
 
-        let obj = parse(&s).unwrap();
+        let obj = DfmObject::parse(&s).unwrap();
         assert_eq!(obj.class_name, b"TForm");
         assert_eq!(obj.children.len(), 1);
         assert_eq!(obj.children[0].class_name, b"TEdit");
         assert_eq!(obj.component_count(), 2);
         // Walk iterator exercises the DFS.
-        let walked: Vec<_> = obj.walk().map(|o| o.class_name_str()).collect();
+        let walked: Vec<&str> = obj.walk().map(DfmObject::class_name).collect();
         assert_eq!(walked, vec!["TForm", "TEdit"]);
     }
 
     #[test]
     fn rejects_missing_magic() {
         let bytes = b"NOTDFM\0\0";
-        assert!(parse(bytes).is_none());
+        assert!(DfmObject::parse(bytes).is_none());
     }
 
     #[test]
