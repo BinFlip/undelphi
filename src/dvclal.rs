@@ -20,6 +20,8 @@
 //! The raw resource bytes are provided by the caller — use the PE resource
 //! walker in [`crate::resources`] to locate them.
 
+use std::fmt;
+
 /// The Delphi / C++Builder SKU that produced this binary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Edition {
@@ -29,6 +31,23 @@ pub enum Edition {
     Professional,
     /// Enterprise / Ultimate / Architect edition.
     Enterprise,
+}
+
+impl Edition {
+    /// Stable label for persistence and display.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Edition::Personal => "Personal",
+            Edition::Professional => "Professional",
+            Edition::Enterprise => "Enterprise",
+        }
+    }
+}
+
+impl fmt::Display for Edition {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 const DVCLAL_PERSONAL: [u8; 16] = [
@@ -63,6 +82,13 @@ pub fn decode(raw: &[u8]) -> Option<Edition> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edition_labels_are_stable() {
+        assert_eq!(Edition::Personal.as_str(), "Personal");
+        assert_eq!(Edition::Professional.to_string(), "Professional");
+        assert_eq!(Edition::Enterprise.as_str(), "Enterprise");
+    }
 
     #[test]
     fn decodes_known_editions() {

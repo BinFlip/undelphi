@@ -357,6 +357,29 @@ pub enum DfmValue<'a> {
 }
 
 impl<'a> DfmValue<'a> {
+    /// Stable label for the value variant, independent of payload.
+    pub const fn kind_str(&self) -> &'static str {
+        match self {
+            DfmValue::Null => "null",
+            DfmValue::Nil => "nil",
+            DfmValue::Bool(_) => "bool",
+            DfmValue::Int(_) => "int",
+            DfmValue::Int64(_) => "int64",
+            DfmValue::UInt64(_) => "uint64",
+            DfmValue::Single(_) => "single",
+            DfmValue::Double(_) => "double",
+            DfmValue::Extended(_) => "extended",
+            DfmValue::Currency(_) => "currency",
+            DfmValue::String(_) => "string",
+            DfmValue::Utf16(_) => "utf16",
+            DfmValue::Binary(_) => "binary",
+            DfmValue::Set(_) => "set",
+            DfmValue::List(_) => "list",
+            DfmValue::Collection(_) => "collection",
+            DfmValue::Unknown { .. } => "unknown",
+        }
+    }
+
     /// Displayable text, for the text-ish variants. Returns:
     ///
     /// - `Some(Cow::Borrowed(_))` for [`DfmValue::String`] (treated as
@@ -374,6 +397,26 @@ impl<'a> DfmValue<'a> {
                     .filter_map(|c| <[u8; 2]>::try_from(c).ok().map(u16::from_le_bytes))
                     .collect();
                 Some(Cow::Owned(String::from_utf16_lossy(&units)))
+            }
+            _ => None,
+        }
+    }
+
+    /// Strict text decode for text-ish variants. Unlike [`Self::as_text`],
+    /// this returns `None` for invalid UTF-8, invalid UTF-16, or odd-length
+    /// UTF-16 byte buffers.
+    pub fn as_text_strict(&self) -> Option<Cow<'_, str>> {
+        match self {
+            DfmValue::String(b) => core::str::from_utf8(b).ok().map(Cow::Borrowed),
+            DfmValue::Utf16(b) => {
+                let chunks = b.chunks_exact(2);
+                if !chunks.remainder().is_empty() {
+                    return None;
+                }
+                let units: Vec<u16> = chunks
+                    .filter_map(|c| <[u8; 2]>::try_from(c).ok().map(u16::from_le_bytes))
+                    .collect();
+                String::from_utf16(&units).ok().map(Cow::Owned)
             }
             _ => None,
         }
@@ -822,6 +865,36 @@ mod tests {
     fn as_text_utf16() {
         let v = DfmValue::Utf16(b"h\0e\0l\0l\0o\0");
         assert_eq!(v.as_text().as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn as_text_strict_rejects_lossy_inputs() {
+        assert_eq!(
+            DfmValue::String(b"hello").as_text_strict().as_deref(),
+            Some("hello")
+        );
+        assert!(DfmValue::String(b"\xff").as_text_strict().is_none());
+        assert_eq!(
+            DfmValue::Utf16(b"h\0i\0").as_text_strict().as_deref(),
+            Some("hi")
+        );
+        assert!(DfmValue::Utf16(b"h\0i").as_text_strict().is_none());
+        assert!(DfmValue::Utf16(&[0x00, 0xd8]).as_text_strict().is_none());
+    }
+
+    #[test]
+    fn kind_str_labels_variants() {
+        assert_eq!(DfmValue::Null.kind_str(), "null");
+        assert_eq!(DfmValue::Bool(true).kind_str(), "bool");
+        assert_eq!(DfmValue::String(b"x").kind_str(), "string");
+        assert_eq!(
+            DfmValue::Unknown {
+                tag: 0xff,
+                body: &[]
+            }
+            .kind_str(),
+            "unknown"
+        );
     }
 
     #[test]

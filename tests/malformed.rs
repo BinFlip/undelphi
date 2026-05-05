@@ -162,8 +162,10 @@ fn dfm_random_trailing_bytes_dont_panic() {
             buf.push((state >> 33) as u8);
         }
         let _ = DfmObject::parse(&buf);
-        let _ = DfmObject::parse_body(&buf[4..], false);
-        let _ = DfmObject::parse_body(&buf[4..], true);
+        if let Some(body) = buf.get(4..) {
+            let _ = DfmObject::parse_body(body, false);
+            let _ = DfmObject::parse_body(body, true);
+        }
     }
 }
 

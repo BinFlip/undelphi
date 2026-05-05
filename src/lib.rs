@@ -117,16 +117,12 @@
 //! }
 //! ```
 
-// This crate is used for malware analysis: every input byte is
-// adversarial and must not be allowed to panic the parser.
-#![deny(
-    missing_docs,
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::arithmetic_side_effects,
-    clippy::indexing_slicing
-)]
+// The `missing_docs`, `clippy::unwrap_used`, `clippy::expect_used`,
+// `clippy::panic`, `clippy::arithmetic_side_effects`, and
+// `clippy::indexing_slicing` lints are declared in `Cargo.toml` under
+// `[lints]` so they enforce on every build regardless of the consuming
+// workspace. undelphi is used in malware-analysis pipelines where every
+// input byte is adversarial and the parser must not panic.
 #![cfg_attr(
     test,
     allow(
@@ -195,6 +191,42 @@ use crate::{
     resources::{find_rcdata, iter_rcdata_named},
     rtti::TkClassInfo,
 };
+
+/// A published property with its declared type resolved in the same pass.
+#[derive(Debug, Clone, Copy)]
+pub struct PropertyWithType<'a> {
+    /// Published property entry.
+    pub property: Property<'a>,
+    /// Resolved `PTypeInfo` header, when the type pointer can be decoded.
+    pub ty: Option<rtti::TypeHeader<'a>>,
+}
+
+/// A published field with its declared type resolved in the same pass.
+#[derive(Debug, Clone, Copy)]
+pub struct FieldWithType<'a> {
+    /// Published field entry.
+    pub field: Field<'a>,
+    /// Resolved `PTypeInfo` header, when the type pointer can be decoded.
+    pub ty: Option<rtti::TypeHeader<'a>>,
+}
+
+/// An interface entry with its vtable methods resolved in the same pass.
+#[derive(Debug, Clone)]
+pub struct InterfaceWithMethods<'a> {
+    /// Class interface-table entry.
+    pub interface: InterfaceEntry<'a>,
+    /// Methods decoded from the interface vtable.
+    pub methods: Vec<interfaces::InterfaceMethod<'a>>,
+}
+
+/// A class attribute with its common string argument decoded in the same pass.
+#[derive(Debug, Clone, Copy)]
+pub struct AttributeWithStringArg<'a> {
+    /// Attribute-table entry.
+    pub attribute: extrtti::AttributeEntry<'a>,
+    /// Decoded single string argument, when the packed argument body has that shape.
+    pub string_arg: Option<&'a [u8]>,
+}
 
 /// Why [`DelphiBinary::parse`] failed.
 ///
@@ -336,6 +368,18 @@ impl<'a> DelphiBinary<'a> {
         self.ctx.format()
     }
 
+    /// PE image base, when the parsed container is PE / PE+.
+    #[inline]
+    pub fn image_base(&self) -> Option<u64> {
+        self.ctx.image_base()
+    }
+
+    /// Convert an absolute VA to a PE RVA using the parsed image base.
+    #[inline]
+    pub fn va_to_rva(&self, va: u64) -> Option<u64> {
+        self.ctx.va_to_rva(va)
+    }
+
     /// Overall confidence in the detection.
     #[inline]
     pub fn confidence(&self) -> Confidence {
@@ -405,6 +449,18 @@ impl<'a> DelphiBinary<'a> {
         &self.classes
     }
 
+    /// Look up a class by its discovery index.
+    #[inline]
+    pub fn class_by_index(&self, index: usize) -> Option<&Class<'a>> {
+        self.classes.get(index)
+    }
+
+    /// Resolve a class's parent through the binary's class index.
+    #[inline]
+    pub fn parent_class(&self, class: &Class<'a>) -> Option<&Class<'a>> {
+        class.parent_index.and_then(|idx| self.classes.get(idx))
+    }
+
     /// Decode the `tkClass` RTTI record referenced by `class.vmt.type_info`.
     ///
     /// Returns `None` when the class carries no RTTI (stripped, or compiled
@@ -425,6 +481,12 @@ impl<'a> DelphiBinary<'a> {
     /// Returns an empty vector when the class has no method table.
     pub fn methods(&self, class: &Class<'a>) -> Vec<MethodEntry<'a>> {
         MethodEntry::iter(&self.ctx, &class.vmt)
+    }
+
+    /// Convert a published method's absolute code VA to a PE RVA.
+    #[inline]
+    pub fn method_rva(&self, method: &MethodEntry<'a>) -> Option<u64> {
+        self.va_to_rva(method.code_va)
     }
 
     /// Decode the class's interface table.
@@ -475,6 +537,18 @@ impl<'a> DelphiBinary<'a> {
             }
         }
         methods
+    }
+
+    /// Decode the class's interface table and resolve each interface's method
+    /// pointers in one pass.
+    pub fn interfaces_with_methods(&self, class: &Class<'a>) -> Vec<InterfaceWithMethods<'a>> {
+        self.interfaces(class)
+            .into_iter()
+            .map(|interface| {
+                let methods = self.interface_methods(&interface);
+                InterfaceWithMethods { interface, methods }
+            })
+            .collect()
     }
 
     /// Decode the virtual-method-pointer array that follows the class's
@@ -562,6 +636,21 @@ impl<'a> DelphiBinary<'a> {
         extrtti::AttributeEntry::iter_class(&self.ctx, class)
     }
 
+    /// Decode class-level attributes and their common single string argument
+    /// shape in one pass.
+    pub fn class_attributes_with_string_args(
+        &self,
+        class: &Class<'a>,
+    ) -> Vec<AttributeWithStringArg<'a>> {
+        self.class_attributes(class)
+            .into_iter()
+            .map(|attribute| AttributeWithStringArg {
+                string_arg: attribute.arg_as_string(),
+                attribute,
+            })
+            .collect()
+    }
+
     /// Look up a published method by name on `class`, walking the
     /// ancestry chain so inherited handlers are found. Returns the
     /// method's code VA, or `None` when unresolved.
@@ -585,6 +674,17 @@ impl<'a> DelphiBinary<'a> {
     /// RTTI (stripped binary, or class compiled without `{$M+}`).
     pub fn properties(&self, class: &Class<'a>) -> Vec<Property<'a>> {
         Property::iter(&self.ctx, &class.vmt)
+    }
+
+    /// Decode published properties and resolve their declared types in one pass.
+    pub fn properties_with_types(&self, class: &Class<'a>) -> Vec<PropertyWithType<'a>> {
+        self.properties(class)
+            .into_iter()
+            .map(|property| PropertyWithType {
+                ty: self.property_type(class, &property),
+                property,
+            })
+            .collect()
     }
 
     /// Resolve the declared type of a property from its `PropType` pointer.
@@ -675,6 +775,17 @@ impl<'a> DelphiBinary<'a> {
     /// (many classes don't) or the table is malformed.
     pub fn fields(&self, class: &Class<'a>) -> Vec<Field<'a>> {
         Field::iter(&self.ctx, &class.vmt)
+    }
+
+    /// Decode published fields and resolve their declared types in one pass.
+    pub fn fields_with_types(&self, class: &Class<'a>) -> Vec<FieldWithType<'a>> {
+        self.fields(class)
+            .into_iter()
+            .map(|field| FieldWithType {
+                ty: self.field_type(class, &field),
+                field,
+            })
+            .collect()
     }
 
     /// Decode every DFM / FMX / LFM / XFM form stream embedded as a

@@ -72,6 +72,13 @@ impl<'a> MethodEntry<'a> {
     pub fn name_bytes(&self) -> &'a [u8] {
         self.name
     }
+
+    /// Convert this method's absolute code VA to an RVA by subtracting
+    /// `image_base`.
+    #[inline]
+    pub fn method_rva(&self, image_base: u64) -> Option<u64> {
+        self.code_va.checked_sub(image_base)
+    }
 }
 
 impl<'a> MethodEntry<'a> {
@@ -175,4 +182,20 @@ fn iter_fpc<'a>(ctx: &BinaryContext<'a>, vmt: &Vmt<'a>) -> Option<Vec<MethodEntr
         });
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn method_rva_subtracts_image_base() {
+        let method = MethodEntry {
+            name: b"Click",
+            code_va: 0x401234,
+            trailer: &[],
+        };
+        assert_eq!(method.method_rva(0x400000), Some(0x1234));
+        assert_eq!(method.method_rva(0x500000), None);
+    }
 }

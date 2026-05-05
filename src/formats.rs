@@ -481,6 +481,20 @@ impl<'a> BinaryContext<'a> {
         }
     }
 
+    /// Image base for PE / PE+ images. Returns `None` for ELF, Mach-O, and
+    /// unparsed containers, where PE-style RVA conversion is not applicable.
+    #[inline]
+    pub fn image_base(&self) -> Option<u64> {
+        self.pe.as_ref().map(|pe| pe.image_base)
+    }
+
+    /// Convert an absolute VA to a PE RVA using the parsed image base.
+    /// Returns `None` when this is not a PE image or subtraction underflows.
+    #[inline]
+    pub fn va_to_rva(&self, va: u64) -> Option<u64> {
+        va.checked_sub(self.image_base()?)
+    }
+
     /// Any segments were registered (i.e. the binary was parseable).
     #[inline]
     pub fn has_segments(&self) -> bool {

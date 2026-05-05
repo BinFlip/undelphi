@@ -5,6 +5,13 @@
 //! CI. If a sample is missing locally (fresh checkout without the large
 //! binary corpus), the test is skipped rather than failing.
 
+#![allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::unwrap_used
+)]
+
 use std::{
     fs,
     path::{Path, PathBuf},

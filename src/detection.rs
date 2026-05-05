@@ -19,7 +19,7 @@
 //!
 //! See `RESEARCH.md` §2 for the full identification strategy.
 
-use std::str;
+use std::{fmt, str};
 
 use crate::formats::BinaryContext;
 
@@ -41,6 +41,24 @@ pub enum Confidence {
     High,
 }
 
+impl Confidence {
+    /// Stable label for persistence and display.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Confidence::None => "none",
+            Confidence::Low => "low",
+            Confidence::Medium => "medium",
+            Confidence::High => "high",
+        }
+    }
+}
+
+impl fmt::Display for Confidence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// The identified toolchain family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Compiler {
@@ -50,6 +68,23 @@ pub enum Compiler {
     CppBuilder,
     /// Free Pascal Compiler (`fpc`), including Lazarus builds.
     FreePascal,
+}
+
+impl Compiler {
+    /// Stable label for persistence and display.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Compiler::Delphi => "Delphi",
+            Compiler::CppBuilder => "C++Builder",
+            Compiler::FreePascal => "Free Pascal",
+        }
+    }
+}
+
+impl fmt::Display for Compiler {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// The target architecture the binary was compiled for.
@@ -65,6 +100,25 @@ pub enum TargetArch {
     Aarch64,
     /// Unknown or not explicitly stated in the build-string.
     Unknown,
+}
+
+impl TargetArch {
+    /// Stable label for persistence and display.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            TargetArch::X86 => "x86",
+            TargetArch::X86_64 => "x86_64",
+            TargetArch::Arm => "arm",
+            TargetArch::Aarch64 => "aarch64",
+            TargetArch::Unknown => "unknown",
+        }
+    }
+}
+
+impl fmt::Display for TargetArch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// The target operating system the binary was compiled for.
@@ -84,6 +138,26 @@ pub enum TargetOs {
     Unknown,
 }
 
+impl TargetOs {
+    /// Stable label for persistence and display.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            TargetOs::Windows => "windows",
+            TargetOs::Darwin => "darwin",
+            TargetOs::Linux => "linux",
+            TargetOs::Android => "android",
+            TargetOs::Ios => "ios",
+            TargetOs::Unknown => "unknown",
+        }
+    }
+}
+
+impl fmt::Display for TargetOs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Which marker in the binary produced the `CompilerInfo`.
 ///
 /// `BuildString` matches carry an exact compiler version; the legacy-marker
@@ -100,6 +174,23 @@ pub enum DetectionSource {
     /// The namespace-prefixed form was introduced with Delphi XE2, so a hit
     /// here indicates XE2 or later.
     NamespacedUnits,
+}
+
+impl DetectionSource {
+    /// Stable label for persistence and display.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            DetectionSource::BuildString => "build_string",
+            DetectionSource::BorlandRegistry => "borland_registry",
+            DetectionSource::NamespacedUnits => "namespaced_units",
+        }
+    }
+}
+
+impl fmt::Display for DetectionSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Compiler build fingerprint extracted from the binary's read-only data.
@@ -565,6 +656,16 @@ fn is_printable_ascii(b: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_enum_labels_are_stable() {
+        assert_eq!(Confidence::High.as_str(), "high");
+        assert_eq!(Confidence::High.to_string(), "high");
+        assert_eq!(Compiler::FreePascal.as_str(), "Free Pascal");
+        assert_eq!(TargetArch::X86_64.as_str(), "x86_64");
+        assert_eq!(TargetOs::Windows.as_str(), "windows");
+        assert_eq!(DetectionSource::BuildString.as_str(), "build_string");
+    }
 
     #[test]
     fn parses_delphi_12_win64_marker() {

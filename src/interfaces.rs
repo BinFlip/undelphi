@@ -173,6 +173,13 @@ impl<'a> InterfaceEntry<'a> {
 }
 
 impl<'a> InterfaceMethod<'a> {
+    /// Convert this method's absolute code VA to an RVA by subtracting
+    /// `image_base`.
+    #[inline]
+    pub fn method_rva(&self, image_base: u64) -> Option<u64> {
+        self.code_va.checked_sub(image_base)
+    }
+
     /// Walk an interface's method-pointer array and return one entry
     /// per slot. The count is recovered by reading pointer-sized
     /// slots from `entry.vtable_va` and stopping at the first slot

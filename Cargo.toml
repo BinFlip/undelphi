@@ -1,6 +1,6 @@
 [package]
 name = "undelphi"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 authors = ["Johann Kempter <admin@binflip.rs>"]
 rust-version = "1.88"
@@ -11,6 +11,20 @@ readme = "README.md"
 keywords = ["delphi", "pascal", "parser", "reverse-engineering", "binary-analysis"]
 categories = ["parser-implementations"]
 exclude = ["tests/samples/", "reference/", "research/"]
+
+# undelphi is used in malware-analysis pipelines where every
+# input byte is adversarial. These lints prevent the parser from panicking
+# on malformed input. The `cfg_attr(test, allow(...))` escape hatch in
+# `src/lib.rs` lets tests still use `unwrap`/`expect`/`panic` for terseness.
+[lints.rust]
+missing_docs = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+arithmetic_side_effects = "deny"
+indexing_slicing = "deny"
 
 [features]
 default = []

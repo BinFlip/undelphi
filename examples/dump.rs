@@ -26,11 +26,11 @@ use undelphi::{
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    if args.len() != 2 {
+    let Some(path) = args.get(1) else {
         eprintln!("usage: dump <path-to-binary>");
         process::exit(2);
-    }
-    let data = match fs::read(&args[1]) {
+    };
+    let data = match fs::read(path) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("read error: {e}");
@@ -45,7 +45,7 @@ fn main() {
         }
     };
 
-    print_overview(&bin, &args[1], data.len());
+    print_overview(&bin, path, data.len());
     print_packageinfo(&bin);
     print_class_tree(&bin);
     print_classes_full(&bin);
@@ -297,11 +297,11 @@ fn print_one_class<'a>(bin: &DelphiBinary<'a>, class: &Class<'a>, flavor: VmtFla
                                 .unwrap_or_else(|| format!("0x{:x}", ae.attr_type_ref));
                         let arg = if let Some(s) = ae.arg_as_string() {
                             format!("({:?})", String::from_utf8_lossy(s))
-                        } else if ae.arg_data.len() == 4 {
-                            let v = u32::from_le_bytes(ae.arg_data.try_into().unwrap());
+                        } else if let Ok(bytes) = ae.arg_data.try_into() {
+                            let v = u32::from_le_bytes(bytes);
                             format!("({})", v)
-                        } else if ae.arg_data.len() == 1 {
-                            format!("({})", ae.arg_data[0])
+                        } else if let Some(byte) = ae.arg_data.first() {
+                            format!("({})", byte)
                         } else if ae.arg_data.is_empty() {
                             String::new()
                         } else {
@@ -491,7 +491,7 @@ fn print_forms(bin: &DelphiBinary<'_>) {
 }
 
 fn print_dfm_object(bin: &DelphiBinary<'_>, obj: &DfmObject<'_>, depth: usize) {
-    let indent = "  ".repeat(depth + 1);
+    let indent = "  ".repeat(depth.saturating_add(1));
     println!(
         "{}<object {}:{}>{}",
         indent,
@@ -531,7 +531,7 @@ fn print_dfm_object(bin: &DelphiBinary<'_>, obj: &DfmObject<'_>, depth: usize) {
         println!("{}  {} = {}{}", indent, name, rendered, handler_link);
     }
     for c in &obj.children {
-        print_dfm_object(bin, c, depth + 1);
+        print_dfm_object(bin, c, depth.saturating_add(1));
     }
 }
 
@@ -683,7 +683,7 @@ fn print_interface_xref(bin: &DelphiBinary<'_>) {
             println!("    {}", c);
         }
         if classes.len() > 20 {
-            println!("    ... {} more", classes.len() - 20);
+            println!("    ... {} more", classes.len().saturating_sub(20));
         }
     }
 }
@@ -708,7 +708,7 @@ fn print_dfm_class_xref(bin: &DelphiBinary<'_>) {
         );
     }
     if entries.len() > 60 {
-        println!("  ... {} more classes", entries.len() - 60);
+        println!("  ... {} more classes", entries.len().saturating_sub(60));
     }
 }
 
@@ -781,11 +781,11 @@ fn print_event_bindings(bin: &DelphiBinary<'_>) {
             );
         }
         if bindings.len() > 10 {
-            println!("    ... {} more", bindings.len() - 10);
+            println!("    ... {} more", bindings.len().saturating_sub(10));
         }
     }
     if ranked.len() > 50 {
-        println!("\n  ... {} more methods", ranked.len() - 50);
+        println!("\n  ... {} more methods", ranked.len().saturating_sub(50));
     }
 }
 
@@ -819,7 +819,7 @@ fn print_blob_catalog(bin: &DelphiBinary<'_>) {
             );
         }
         if list.len() > 20 {
-            println!("    ... {} more", list.len() - 20);
+            println!("    ... {} more", list.len().saturating_sub(20));
         }
     }
 }

@@ -16,6 +16,8 @@
 //! but warrants a different label depending on consumer priority. Dedup
 //! is the consumer's job.
 
+use std::fmt;
+
 use crate::{
     DelphiBinary,
     classes::Class,
@@ -79,6 +81,38 @@ impl<'a> CodeEntrypoint<'a> {
             class,
             name_hint,
         }
+    }
+
+    /// Convert this entrypoint's absolute VA to an RVA by subtracting
+    /// `image_base`.
+    #[inline]
+    pub fn rva(&self, image_base: u64) -> Option<u64> {
+        self.va.checked_sub(image_base)
+    }
+}
+
+impl EntrypointKind {
+    /// Stable label for consumers that persist entrypoint kinds.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            EntrypointKind::PublishedMethod => "published_method",
+            EntrypointKind::VmtSlot => "vmt_slot",
+            EntrypointKind::DynamicMessage => "dynamic_message",
+            EntrypointKind::InterfaceGetter => "interface_getter",
+            EntrypointKind::InterfaceMethod => "interface_method",
+            EntrypointKind::PropertyGetter => "property_getter",
+            EntrypointKind::PropertySetter => "property_setter",
+            EntrypointKind::PropertyStored => "property_stored",
+            EntrypointKind::AttributeCtor => "attribute_ctor",
+            EntrypointKind::UnitInit => "unit_init",
+            EntrypointKind::UnitFinalize => "unit_finalize",
+        }
+    }
+}
+
+impl fmt::Display for EntrypointKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -212,10 +246,8 @@ pub fn collect<'a>(bin: &'a DelphiBinary<'a>) -> Vec<CodeEntrypoint<'a>> {
             );
         }
 
-        // Class-level [attribute] constructors. Returns empty in v0.2.0
-        // (see DelphiBinary::class_attributes); the call is here so the
-        // helper picks them up automatically once the table-VA extractor
-        // lands.
+        // Class-level [attribute] constructors. The call is here so the helper
+        // picks them up automatically as attribute-table coverage expands.
         for attr in bin.class_attributes(class) {
             out.push(CodeEntrypoint::new(
                 attr.attr_ctor,
@@ -226,8 +258,8 @@ pub fn collect<'a>(bin: &'a DelphiBinary<'a>) -> Vec<CodeEntrypoint<'a>> {
         }
     }
 
-    // Unit-level init / finalize. Returns empty in v0.2.0; included for
-    // forward-compatibility.
+    // Unit-level init / finalize. Delphi binaries return empty by design;
+    // FPC binaries use the INITFINAL table when present.
     for unit in bin.unit_init_procs() {
         if let Some(va) = unit.init_va {
             out.push(CodeEntrypoint::new(
@@ -285,5 +317,28 @@ fn push_property_access<'a>(
         }
         // Field / Const / None: not a code address.
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn entrypoint_kind_labels_are_stable() {
+        assert_eq!(EntrypointKind::PublishedMethod.as_str(), "published_method");
+        assert_eq!(EntrypointKind::UnitFinalize.to_string(), "unit_finalize");
+    }
+
+    #[test]
+    fn code_entrypoint_rva_subtracts_image_base() {
+        let entry = CodeEntrypoint::new(
+            0x401000,
+            EntrypointKind::PublishedMethod,
+            None,
+            "TForm.Click".to_string(),
+        );
+        assert_eq!(entry.rva(0x400000), Some(0x1000));
+        assert_eq!(entry.rva(0x500000), None);
     }
 }

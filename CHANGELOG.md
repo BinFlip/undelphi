@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.2.1
+
+Ergonomic release driven by downstream-consumer feedback. This version keeps
+the public API additive and leaves the larger `AccessTarget` narrowing for a
+future breaking release.
+
+### Added
+
+- PE image-base and VA-to-RVA helpers: `DelphiBinary::image_base`,
+  `DelphiBinary::va_to_rva`, `BinaryContext::image_base`, and
+  `BinaryContext::va_to_rva`.
+- Method and entrypoint RVA helpers: `DelphiBinary::method_rva`,
+  `MethodEntry::method_rva`, `InterfaceMethod::method_rva`, and
+  `CodeEntrypoint::rva`.
+- Stable `as_str()` labels and `Display` impls for `Confidence`, `Compiler`,
+  `TargetArch`, `TargetOs`, `DetectionSource`, `Edition`, and
+  `EntrypointKind`.
+- Batched class-member accessors: `properties_with_types`,
+  `fields_with_types`, `interfaces_with_methods`, and
+  `class_attributes_with_string_args`.
+- Handle-based class lookup helpers: `DelphiBinary::class_by_index` and
+  `DelphiBinary::parent_class`.
+- DFM value helpers: `DfmValue::kind_str()` and strict text decoding via
+  `DfmValue::as_text_strict()`.
+
 ## 0.2.0
 
 Major API revision. Most existing call sites need small migrations
