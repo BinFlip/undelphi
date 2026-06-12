@@ -17,14 +17,15 @@
 
 use std::{fs, path::Path};
 
-use undelphi::{
-    DelphiBinary,
-    detection::Compiler,
-    rtti::TypeDetail,
-};
+use undelphi::{DelphiBinary, detection::Compiler, rtti::TypeDetail};
 
 fn load(rel: &str) -> Option<Vec<u8>> {
-    fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/samples").join(rel)).ok()
+    fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/samples")
+            .join(rel),
+    )
+    .ok()
 }
 
 /// Assert the exact RTTI we expect from `known.pas`, for one compiled
@@ -32,17 +33,28 @@ fn load(rel: &str) -> Option<Vec<u8>> {
 /// model must be identical across pointer widths.
 fn assert_known_rtti(data: &[u8]) {
     let bin = DelphiBinary::parse(data).expect("should parse as FPC");
-    assert_eq!(bin.compiler().map(|c| c.compiler), Some(Compiler::FreePascal));
+    assert_eq!(
+        bin.compiler().map(|c| c.compiler),
+        Some(Compiler::FreePascal)
+    );
 
     let classes = bin.classes();
 
     // TShape : TPersistent — three published properties, exact types.
     let tshape = classes.find_by_name("TShape").expect("TShape");
-    assert_eq!(classes.ancestors(tshape).next().map(|a| a.name()), Some("TPersistent"));
+    assert_eq!(
+        classes.ancestors(tshape).next().map(|a| a.name()),
+        Some("TPersistent")
+    );
     let shape_props: Vec<(String, Option<String>)> = bin
         .properties_with_types(tshape)
         .iter()
-        .map(|p| (p.property.name().to_string(), p.ty.map(|h| h.name().to_string())))
+        .map(|p| {
+            (
+                p.property.name().to_string(),
+                p.ty.map(|h| h.name().to_string()),
+            )
+        })
         .collect();
     assert_eq!(
         shape_props,
@@ -56,11 +68,19 @@ fn assert_known_rtti(data: &[u8]) {
 
     // TButton : TShape — two properties + a published method.
     let tbutton = classes.find_by_name("TButton").expect("TButton");
-    assert_eq!(classes.ancestors(tbutton).next().map(|a| a.name()), Some("TShape"));
+    assert_eq!(
+        classes.ancestors(tbutton).next().map(|a| a.name()),
+        Some("TShape")
+    );
     let btn_props: Vec<(String, Option<String>)> = bin
         .properties_with_types(tbutton)
         .iter()
-        .map(|p| (p.property.name().to_string(), p.ty.map(|h| h.name().to_string())))
+        .map(|p| {
+            (
+                p.property.name().to_string(),
+                p.ty.map(|h| h.name().to_string()),
+            )
+        })
         .collect();
     assert_eq!(
         btn_props,
@@ -87,7 +107,11 @@ fn assert_known_rtti(data: &[u8]) {
         .iter()
         .map(|v| String::from_utf8_lossy(v).to_string())
         .collect();
-    assert_eq!(values, ["clRed", "clGreen", "clBlue", "clAlpha"], "TColor values");
+    assert_eq!(
+        values,
+        ["clRed", "clGreen", "clBlue", "clAlpha"],
+        "TColor values"
+    );
 
     // tkMethod — the event signature, exactly (FPC emits an explicit hidden
     // Self as the first parameter).
@@ -150,13 +174,23 @@ fn known_rtti_fpc304_win32_subset() {
     let classes = bin.classes();
 
     let tshape = classes.find_by_name("TShape").expect("TShape");
-    assert_eq!(classes.ancestors(tshape).next().map(|a| a.name()), Some("TPersistent"));
+    assert_eq!(
+        classes.ancestors(tshape).next().map(|a| a.name()),
+        Some("TPersistent")
+    );
     // Property names decode; types are the documented 3.0.4 gap.
     let names: Vec<&str> = bin.properties(tshape).iter().map(|p| p.name()).collect();
-    assert_eq!(names, vec!["Name", "Color", "Visible"], "TShape property names");
+    assert_eq!(
+        names,
+        vec!["Name", "Color", "Visible"],
+        "TShape property names"
+    );
 
     let tbutton = classes.find_by_name("TButton").expect("TButton");
-    assert_eq!(classes.ancestors(tbutton).next().map(|a| a.name()), Some("TShape"));
+    assert_eq!(
+        classes.ancestors(tbutton).next().map(|a| a.name()),
+        Some("TShape")
+    );
     let methods: Vec<&str> = bin.methods(tbutton).iter().map(|m| m.name()).collect();
     assert_eq!(methods, vec!["Click"], "TButton published methods");
 }
