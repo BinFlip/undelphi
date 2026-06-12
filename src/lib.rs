@@ -154,6 +154,7 @@ pub mod properties;
 pub mod render;
 pub mod resources;
 pub mod rtti;
+pub mod signatures;
 pub mod vmt;
 pub mod vmttables;
 pub mod vtable;
@@ -185,6 +186,7 @@ use crate::{
     fields::Field,
     formats::{BinaryContext, BinaryFormat},
     interfaces::InterfaceEntry,
+    limits::{MAX_FORMS_RAW_SCAN, MAX_RTTI_TYPES},
     methods::MethodEntry,
     packageinfo::PackageInfo,
     properties::Property,
@@ -489,6 +491,73 @@ impl<'a> DelphiBinary<'a> {
         self.va_to_rva(method.code_va)
     }
 
+    /// Decode method signatures (calling convention, ordered parameters with
+    /// names / types / passing mode, and return type) for `class`.
+    ///
+    /// The result is era-tagged: [`signatures::SignatureReport::Decoded`]
+    /// carries the signatures, [`signatures::SignatureReport::Absent`] means
+    /// the compiler emitted no signature RTTI for this class (classic /
+    /// pre-2010 Delphi, or FPC without extended method RTTI), and
+    /// [`signatures::SignatureReport::Unsupported`] means signature RTTI is
+    /// present but in a layout this parser does not decode yet.
+    ///
+    /// Decodes two Delphi sources: the published-method trailer
+    /// (`{$METHODINFO ON}` binaries, rare) and the **extended-method
+    /// section** of the `vmtMethodTable` (default extended RTTI on Delphi
+    /// 2010+ — the primary source). Pre-2010 Delphi and FPC carry neither
+    /// and report [`Absent`](signatures::SignatureReport::Absent); the FPC
+    /// `TVmtMethodExTable` is a later iteration.
+    pub fn method_signatures(&self, class: &Class<'a>) -> signatures::SignatureReport<'a> {
+        let ptr_size = class.vmt.pointer_size as usize;
+        let flavor = class.vmt.flavor;
+        let mut out = Vec::new();
+
+        // Published-method trailers (only present under `{$METHODINFO ON}`).
+        for m in self.methods(class) {
+            if m.trailer.is_empty() {
+                continue;
+            }
+            if let Some(sig) = signatures::MethodSignature::from_published_trailer(
+                &self.ctx,
+                m.name(),
+                m.code_va,
+                m.trailer,
+                ptr_size,
+                flavor,
+            ) {
+                out.push(sig);
+            }
+        }
+
+        // Delphi 2010+ extended-method section (the common source).
+        for ext in methods::DelphiExtMethod::iter(&self.ctx, &class.vmt) {
+            if ext.trailer.is_empty() {
+                continue;
+            }
+            let info = signatures::ExtendedMethodInfo {
+                flags: ext.flags,
+                vmt_index: ext.vmt_index,
+            };
+            if let Some(sig) = signatures::MethodSignature::from_delphi_extended(
+                &self.ctx,
+                ext.name(),
+                ext.code_va,
+                ext.trailer,
+                ptr_size,
+                flavor,
+                info,
+            ) {
+                out.push(sig);
+            }
+        }
+
+        if out.is_empty() {
+            signatures::SignatureReport::Absent
+        } else {
+            signatures::SignatureReport::Decoded(out)
+        }
+    }
+
     /// Decode the class's interface table.
     pub fn interfaces(&self, class: &Class<'a>) -> Vec<InterfaceEntry<'a>> {
         InterfaceEntry::iter(&self.ctx, &class.vmt)
@@ -788,6 +857,151 @@ impl<'a> DelphiBinary<'a> {
             .collect()
     }
 
+    /// Enumerate every RTTI type record reachable by following `PPTypeInfo`
+    /// pointers from the class graph and the published property / field type
+    /// references — a transitive closure over the binary's type graph, with
+    /// **no raw scanning**.
+    ///
+    /// This surfaces types the per-class accessors never reach on their own:
+    /// enumerations (with their value names), sets, records, dynamic arrays,
+    /// method-pointer types, and even class records for classes that are
+    /// referenced only as a member type and never instantiated (so they have
+    /// no scannable VMT).
+    ///
+    /// On Delphi binaries a second, **self-cell pass** then surfaces types the
+    /// compiler emits but references only from *code* (`TypeInfo(X)`), which no
+    /// data-pointer walk can reach. Every Delphi `PTypeInfo` record is preceded
+    /// by a self-referencing `PPTypeInfo` cell (`va - ptr_size` points at `va`)
+    /// — the same structural signature the VMT scanner uses for `vmtSelfPtr` —
+    /// so a pointer-aligned pass over the read-only sections recovers them with
+    /// negligible false-positive risk. FPC does not emit these cells, so the
+    /// closure alone covers FPC. Together these reach ~97 % of every
+    /// `PTypeInfo` referenced anywhere in a Delphi image (HeidiSQL 12: ~6 600
+    /// types; the enum dictionary alone grows from ~250 to ~880).
+    ///
+    /// Results are deduplicated by `PTypeInfo` VA and bounded by
+    /// [`crate::limits::MAX_RTTI_TYPES`]. Match on the [`rtti::TypeDetail`]
+    /// variant for kind-specific views — e.g. collect every
+    /// [`rtti::TypeDetail::Enumeration`] for the binary's enum dictionary.
+    pub fn types(&self) -> Vec<rtti::TypeDetail<'a>> {
+        let classes = self.classes();
+        let flavor = classes
+            .iter()
+            .next()
+            .map(|c| c.vmt.flavor)
+            .unwrap_or(vmt::VmtFlavor::Delphi);
+        let ptr_size = self.ctx.pointer_size().unwrap_or(4);
+
+        // Seed the walk with class type-info records plus published property
+        // and field type references. The latter live in the `TPropData` /
+        // field-table structures (not inside the type records), so they must
+        // be seeded explicitly; the closure propagates from there.
+        let mut work: Vec<u64> = Vec::new();
+        for c in classes.iter() {
+            if c.vmt.type_info != 0 {
+                work.push(c.vmt.type_info);
+            }
+            for p in self.properties_with_types(c) {
+                if let Some(t) = p.ty {
+                    work.push(t.va);
+                }
+            }
+            for f in self.fields_with_types(c) {
+                if let Some(t) = f.ty {
+                    work.push(t.va);
+                }
+            }
+            // Method-signature parameter and return types (the extended
+            // method section). These are `PPTypeInfo` references, so they
+            // are dereferenced once to the target `PTypeInfo` before seeding.
+            for sig in self.method_signatures(c).decoded() {
+                let mut refs: Vec<u64> = sig.params.iter().map(|p| p.type_va).collect();
+                refs.push(sig.result_type_va);
+                for pp in refs {
+                    if pp != 0
+                        && let Some(t) = rtti::TypeHeader::deref_pptypeinfo(&self.ctx, pp, ptr_size)
+                    {
+                        work.push(t);
+                    }
+                }
+            }
+            // Extended-RTTI property types (non-published visibilities the
+            // classic `TPropData` doesn't list). `prop_type_ref` is a
+            // `PPTypeInfo`.
+            for ep in self.extended_properties(c) {
+                if ep.prop_type_ref != 0
+                    && let Some(t) =
+                        rtti::TypeHeader::deref_pptypeinfo(&self.ctx, ep.prop_type_ref, ptr_size)
+                {
+                    work.push(t);
+                }
+            }
+        }
+
+        let mut seen: HashSet<u64> = HashSet::new();
+        let mut out: Vec<rtti::TypeDetail<'a>> = Vec::new();
+        while let Some(va) = work.pop() {
+            if out.len() >= MAX_RTTI_TYPES {
+                break;
+            }
+            if va == 0 || !seen.insert(va) {
+                continue;
+            }
+            let Some(detail) = rtti::TypeDetail::from_va(&self.ctx, va, flavor) else {
+                continue;
+            };
+            for pp in detail.referenced_pptrs() {
+                if pp == 0 {
+                    continue;
+                }
+                if let Some(target) = rtti::TypeHeader::deref_pptypeinfo(&self.ctx, pp, ptr_size) {
+                    work.push(target);
+                }
+            }
+            out.push(detail);
+        }
+
+        // Self-cell pass (Delphi only). Every Delphi `PTypeInfo` record is
+        // immediately preceded by a self-referencing `PPTypeInfo` cell:
+        // `va - ptr_size` holds a pointer to `va`. This is the direct analogue
+        // of the `vmtSelfPtr` heuristic the VMT scanner uses, and a structural
+        // signature — not a magic-byte guess — because a random pointer-aligned
+        // slot points at exactly `itself + ptr_size` with negligible
+        // probability, and the target must additionally decode as a valid type
+        // record. Scanning these cells surfaces types the compiler emits but
+        // references only from code (`TypeInfo(X)`), which the class-graph
+        // closure never reaches. FPC does not emit the cells, so this finds
+        // nothing there and the closure stands.
+        if flavor == vmt::VmtFlavor::Delphi {
+            for range in self.ctx.sections().scan_targets.iter() {
+                if out.len() >= MAX_RTTI_TYPES {
+                    break;
+                }
+                let Some(section) = self.ctx.section_data(range) else {
+                    continue;
+                };
+                let mut o = 0usize;
+                while o.saturating_add(ptr_size) <= section.len() {
+                    if out.len() >= MAX_RTTI_TYPES {
+                        break;
+                    }
+                    let cell_va = range.va.wrapping_add(o as u64);
+                    if let Some(val) = util::read_ptr(section, o, ptr_size)
+                        && val == cell_va.wrapping_add(ptr_size as u64)
+                        && !seen.contains(&val)
+                        && let Some(detail) = rtti::TypeDetail::from_va(&self.ctx, val, flavor)
+                    {
+                        seen.insert(val);
+                        out.push(detail);
+                    }
+                    o = o.saturating_add(ptr_size);
+                }
+            }
+        }
+
+        out
+    }
+
     /// Decode every DFM / FMX / LFM / XFM form stream embedded as a
     /// resource. Combines two source paths:
     ///
@@ -844,7 +1058,49 @@ impl<'a> DelphiBinary<'a> {
             }
         }
 
+        // 3. Last-resort raw magic-byte scan. Only when the structured
+        //    passes above found nothing — stripped or unconventionally
+        //    packaged binaries whose form streams aren't reachable through
+        //    the PE resource directory or the FPC internal-resources tree,
+        //    but whose `TPF0`/`TPF1` bytes survive verbatim in the image
+        //    (commonly in an overlay a packer appended, or in a `.rsrc`
+        //    section whose directory a protector mangled). Every candidate
+        //    is validated by re-parsing; coincidental matches that don't
+        //    decode are discarded.
+        if out.is_empty() {
+            self.scan_forms_raw(&mut out, &mut seen_names);
+        }
+
         out
+    }
+
+    /// Scan the whole input buffer for `TPF0` / `TPF1` form streams and push
+    /// every validated, not-yet-seen form into `out`.
+    ///
+    /// This is the last-resort path described in [`Self::extract_forms`]; it
+    /// only runs when the structured resource passes yielded nothing. The
+    /// scanning and per-hit validation live in [`dfm::scan_streams`], bounded
+    /// by [`crate::limits::MAX_FORMS_RAW_SCAN`]; this wrapper only assigns
+    /// each hit a name and deduplicates against the structured passes.
+    fn scan_forms_raw(
+        &self,
+        out: &mut Vec<(String, DfmObject<'a>)>,
+        seen_names: &mut HashSet<String>,
+    ) {
+        for (offset, obj) in dfm::scan_streams(self.ctx.data(), MAX_FORMS_RAW_SCAN) {
+            // The structured passes key on the resource name; a raw hit has
+            // none, so key on the form's own object name, falling back to
+            // `<class>@<file-offset>` when the root object is anonymous.
+            let object_name = obj.object_name();
+            let name = if object_name.is_empty() {
+                format!("{}@0x{offset:x}", obj.class_name())
+            } else {
+                object_name.to_owned()
+            };
+            if seen_names.insert(name.clone()) {
+                out.push((name, obj));
+            }
+        }
     }
 
     /// Walk every parsed form and surface every embedded `vaBinary` blob,

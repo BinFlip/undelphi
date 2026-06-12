@@ -295,10 +295,12 @@ fn iter_fpc<'a>(ctx: &BinaryContext<'a>, vmt: &Vmt<'a>) -> Option<Vec<Field<'a>>
 }
 
 fn ptr_aligned_on_non_x86(ctx: &BinaryContext<'_>) -> bool {
-    // Mach-O and ELF binaries on ARM / ARM64 get FPC's proper-alignment
-    // mode. We approximate by "not PE" since Mach-O on ARM is our main
-    // case. PE (Windows) always uses x86/x86-64 where FPC keeps packed.
-    !ctx.format().is_pe()
+    // FPC pointer-aligns field-table records only on
+    // `FPC_REQUIRES_PROPER_ALIGNMENT` architectures (ARM / AArch64). x86 /
+    // x86-64 stay packed on every container — PE *and* ELF / Mach-O — so the
+    // decision is made from the architecture, not from "is this PE?" (which
+    // wrongly aligned x86-64 ELF / Mach-O).
+    ctx.target_arch().fpc_requires_proper_alignment()
 }
 
 #[inline]

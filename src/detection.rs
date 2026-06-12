@@ -113,6 +113,25 @@ impl TargetArch {
             TargetArch::Unknown => "unknown",
         }
     }
+
+    /// Whether FPC lays out `TTypeData` records with natural alignment on
+    /// this architecture.
+    ///
+    /// FPC defines `FPC_REQUIRES_PROPER_ALIGNMENT` on RISC targets
+    /// (ARM / AArch64 / PowerPC / SPARC) but **not** on x86 / x86-64, which
+    /// keep `TTypeData` packed *regardless of the container OS*. The flag is
+    /// purely a function of the CPU, so it must be decided from the
+    /// architecture — not approximated from "is this a PE?" (that proxy
+    /// breaks on x86-64 ELF / Mach-O, which are packed yet not PE).
+    ///
+    /// `Unknown` is treated as packed: the dominant non-RISC case is x86,
+    /// and on PE the architecture is frequently left `Unknown` for older
+    /// Delphi output that emits no build-string arch.
+    ///
+    /// Source: `reference/fpc-source/rtl/objpas/typinfo.pp:867-871`.
+    pub(crate) const fn fpc_requires_proper_alignment(self) -> bool {
+        matches!(self, TargetArch::Arm | TargetArch::Aarch64)
+    }
 }
 
 impl fmt::Display for TargetArch {

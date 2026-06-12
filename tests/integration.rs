@@ -27,6 +27,7 @@ use undelphi::{
     layout::reconstruct,
     render::render_enum_ordinal,
     rtti::{TypeDetail, TypeKind},
+    signatures::{SignatureReport, SignatureSource},
     xref::{dfm_class_instantiations, interface_implementors},
 };
 
@@ -433,6 +434,28 @@ fn doublecmd_win32_fpc_322() {
             .any(|p| p.init_va.is_some() || p.finalize_va.is_some()),
         "every entry was a no-op — heuristic likely locked onto garbage"
     );
+
+    // FPC tkMethod (method-pointer / event types) decode with the FPC param
+    // layout (2-byte TParamFlags set, vs Delphi's 1 byte). TNotifyEvent =
+    // procedure(Sender: TObject) of object — FPC emits an explicit hidden
+    // Self parameter, so the source `Sender: TObject` is the second param.
+    let notify = bin
+        .types()
+        .into_iter()
+        .find_map(|t| match t {
+            TypeDetail::Method(m) if m.header.name() == "TNotifyEvent" => Some(m),
+            _ => None,
+        })
+        .expect("TNotifyEvent method type");
+    let pairs: Vec<(&str, &str)> = notify
+        .params
+        .iter()
+        .map(|p| (p.name(), p.type_name()))
+        .collect();
+    assert!(
+        pairs.contains(&("Sender", "TObject")),
+        "FPC TNotifyEvent should decode `Sender: TObject`; got {pairs:?}"
+    );
 }
 
 #[test]
@@ -655,6 +678,435 @@ fn standalone_exes_have_exactly_one_root() {
             classes.root_count()
         );
     }
+}
+
+#[test]
+fn doublecmd_linux_x86_64_fpc_322() {
+    // First Linux ELF sample in the corpus. Exercises the `Elf64` container
+    // dispatch and, critically, the `EI_OSABI` → `TargetOs::Linux` inference
+    // path that no other sample reaches. Double Commander is the same
+    // Lazarus/FPC application as the Win32 sample, recompiled for Linux.
+    let Some(data) = load("doublecmd/linux_x86_64/doublecmd.elf") else {
+        eprintln!("skipping: sample missing");
+        return;
+    };
+    let bin = DelphiBinary::parse(&data).expect("should detect fpc ELF binary");
+    assert!(bin.format().is_elf(), "format: {:?}", bin.format());
+    assert_eq!(bin.format().bitness(), Some(8));
+    // The whole point of this sample: ELF OS inference with no PE/Mach-O hint.
+    assert_eq!(bin.target_os(), TargetOs::Linux);
+    assert_eq!(bin.target_arch(), TargetArch::X86_64);
+
+    let info = bin.compiler().expect("should have FPC build-string");
+    assert_eq!(info.compiler, Compiler::FreePascal);
+    assert_eq!(info.version, Some("3.2.2"));
+    assert_eq!(info.arch, TargetArch::X86_64);
+    assert_eq!(info.os, TargetOs::Linux);
+
+    // DVCLAL / PACKAGEINFO are PE-only resources — absent on ELF.
+    assert!(bin.edition().is_none());
+    assert!(bin.package_info().is_none());
+
+    // Class tree decoded from `.data`/`.rodata` scan targets on ELF.
+    let classes = bin.classes();
+    assert!(
+        classes.len() > 2000,
+        "expected >2000 classes on ELF sample, got {}",
+        classes.len()
+    );
+    assert_eq!(classes.root().map(|c| c.name()), Some("TObject"));
+    assert_eq!(classes.root_count(), 1);
+    assert_ancestry(&bin, "TComponent", &["TPersistent", "TObject"]);
+
+    // Regression guard for the x86-64-non-PE alignment fix: FPC packs
+    // `TTypeData` on x86-64 regardless of container, so the tkClass decoder
+    // must NOT insert ARM-style padding. Before the fix every unit name and
+    // field table on this sample decoded to garbage and was rejected.
+    assert_eq!(
+        bin.unit_name(classes.find_by_name("TObject").unwrap()),
+        Some("System")
+    );
+    let named = classes
+        .iter()
+        .filter(|c| bin.unit_name(c).is_some())
+        .count();
+    assert!(
+        named > 2000,
+        "expected most classes to carry unit names, got {named}/{}",
+        classes.len()
+    );
+
+    // Method-table extraction (FPC PShortString-deref layout) on ELF, plus
+    // unit name and field table (both gated by the same alignment path).
+    let tmain = classes.find_by_name("TfrmMain").expect("TfrmMain present");
+    assert_eq!(bin.unit_name(tmain), Some("fMain"));
+    assert!(bin.methods(tmain).len() > 50);
+    assert!(
+        bin.fields(tmain).len() > 100,
+        "field table should decode on ELF x86-64, got {}",
+        bin.fields(tmain).len()
+    );
+
+    // Form streams live in FPC internal resources, not a PE `.rsrc` dir.
+    assert!(
+        bin.forms().len() > 100,
+        "expected >100 forms from FPC resources, got {}",
+        bin.forms().len()
+    );
+}
+
+#[test]
+fn doublecmd_macos_x86_64_fpc_322() {
+    // Mach-O x86_64 sample. The existing macOS sample is aarch64, which
+    // takes the `FPC_REQUIRES_PROPER_ALIGNMENT` RTTI padding path; x86_64
+    // is *packed* (no alignment padding), so this exercises the other
+    // branch of the tkClass decoder on Mach-O.
+    let Some(data) = load("doublecmd/macos_x86_64/doublecmd.macho") else {
+        eprintln!("skipping: sample missing");
+        return;
+    };
+    let bin = DelphiBinary::parse(&data).expect("should detect fpc Mach-O binary");
+    assert!(bin.format().is_macho(), "format: {:?}", bin.format());
+    assert_eq!(bin.format().bitness(), Some(8));
+    assert_eq!(bin.target_os(), TargetOs::Darwin);
+    assert_eq!(bin.target_arch(), TargetArch::X86_64);
+
+    let info = bin.compiler().expect("should have FPC build-string");
+    assert_eq!(info.compiler, Compiler::FreePascal);
+    assert_eq!(info.version, Some("3.2.2"));
+    assert_eq!(info.arch, TargetArch::X86_64);
+    assert_eq!(info.os, TargetOs::Darwin);
+
+    assert!(bin.edition().is_none());
+    assert!(bin.package_info().is_none());
+
+    let classes = bin.classes();
+    assert!(
+        classes.len() > 2000,
+        "expected >2000 classes on Mach-O x86_64 sample, got {}",
+        classes.len()
+    );
+    assert_eq!(classes.root().map(|c| c.name()), Some("TObject"));
+    assert_eq!(classes.root_count(), 1);
+    assert_ancestry(&bin, "TComponent", &["TPersistent", "TObject"]);
+
+    // Same alignment-fix regression guard as the ELF test: x86-64 Mach-O is
+    // packed, unlike the aarch64 Mach-O sample which is naturally aligned.
+    assert_eq!(
+        bin.unit_name(classes.find_by_name("TObject").unwrap()),
+        Some("System")
+    );
+    let named = classes
+        .iter()
+        .filter(|c| bin.unit_name(c).is_some())
+        .count();
+    assert!(
+        named > 2000,
+        "expected most classes to carry unit names, got {named}/{}",
+        classes.len()
+    );
+
+    let tmain = classes.find_by_name("TfrmMain").expect("TfrmMain present");
+    assert_eq!(bin.unit_name(tmain), Some("fMain"));
+    assert!(bin.methods(tmain).len() > 50);
+    assert!(
+        bin.fields(tmain).len() > 100,
+        "field table should decode on Mach-O x86-64, got {}",
+        bin.fields(tmain).len()
+    );
+
+    assert!(
+        bin.forms().len() > 100,
+        "expected >100 forms from FPC resources, got {}",
+        bin.forms().len()
+    );
+}
+
+#[test]
+fn heidisql_win64_method_signatures() {
+    // Delphi 2010+ emits method signatures by default in the extended
+    // section of the `vmtMethodTable` — name, ordered params (name / type /
+    // passing mode) and return type. This exercises that walker + decoder.
+    let Some(data) = load("heidisql/portable_x64/heidisql.exe") else {
+        eprintln!("skipping: sample missing");
+        return;
+    };
+    let bin = DelphiBinary::parse(&data).expect("should detect delphi binary");
+    let classes = bin.classes();
+
+    // `TObject.Create` is universal; its first parameter is the implicit
+    // `Self`, passed by the extended-method section.
+    let tobject = classes.find_by_name("TObject").expect("TObject present");
+    let sigs = match bin.method_signatures(tobject) {
+        SignatureReport::Decoded(s) => s,
+        other => panic!("expected decoded signatures for TObject, got {other:?}"),
+    };
+    let create = sigs
+        .iter()
+        .find(|s| s.name == Some("Create"))
+        .expect("TObject.Create signature");
+    assert_eq!(create.source, SignatureSource::DelphiExtendedRtti);
+    assert_eq!(
+        create.params.first().and_then(|p| p.name),
+        Some("Self"),
+        "first parameter of an instance method is the implicit Self"
+    );
+
+    // The extended-method walk should yield signatures across the tree.
+    let total: usize = classes
+        .iter()
+        .map(|c| bin.method_signatures(c).decoded().len())
+        .sum();
+    assert!(
+        total > 5000,
+        "expected many decoded signatures, got {total}"
+    );
+
+    // At least one parameter resolves a (non-Self) type name, and at least
+    // one function resolves a return type — proving PPTypeInfo resolution.
+    let mut typed_param = false;
+    let mut has_return = false;
+    'outer: for c in classes.iter() {
+        for s in bin.method_signatures(c).decoded() {
+            if s.params
+                .iter()
+                .any(|p| p.name != Some("Self") && p.type_name.is_some())
+            {
+                typed_param = true;
+            }
+            if s.result_type_name.is_some() {
+                has_return = true;
+            }
+            if typed_param && has_return {
+                break 'outer;
+            }
+        }
+    }
+    assert!(typed_param, "expected at least one resolved parameter type");
+    assert!(has_return, "expected at least one resolved return type");
+}
+
+#[test]
+fn delphi7_has_no_extended_method_signatures() {
+    // Pre-2010 Delphi has no extended-method section. The walker must not
+    // mistake the bytes following the published-method table for one (the
+    // `is_plausible_method_name` guard); a regression here resurfaces as
+    // spurious empty-named signatures.
+    let Some(data) = load("lightalloy/LA.exe") else {
+        eprintln!("skipping: sample missing");
+        return;
+    };
+    let bin = DelphiBinary::parse(&data).expect("should detect delphi 7 binary");
+    let any = bin
+        .classes()
+        .iter()
+        .any(|c| !matches!(bin.method_signatures(c), SignatureReport::Absent));
+    assert!(!any, "Delphi 7 should yield no method signatures");
+}
+
+/// Collect an enumeration's value names by type name from `bin.types()`.
+fn enum_values(bin: &DelphiBinary<'_>, name: &str) -> Option<Vec<String>> {
+    bin.types().into_iter().find_map(|t| match t {
+        TypeDetail::Enumeration(e) if e.header.name() == name => Some(
+            e.values
+                .iter()
+                .map(|v| String::from_utf8_lossy(v).to_string())
+                .collect(),
+        ),
+        _ => None,
+    })
+}
+
+#[test]
+fn delphi7_type_closure_recovers_standalone_rtti() {
+    // The transitive type closure (`bin.types()`) follows PPTypeInfo pointers
+    // from the class graph to reach standalone RTTI — enums, sets, method
+    // types — that the per-class accessors never surface. No raw scanning.
+    let Some(data) = load("lightalloy/LA.exe") else {
+        eprintln!("skipping: sample missing");
+        return;
+    };
+    let bin = DelphiBinary::parse(&data).expect("delphi 7");
+    let types = bin.types();
+    assert!(
+        types.len() > 300,
+        "closure should reach hundreds of types, got {}",
+        types.len()
+    );
+
+    let enums = types
+        .iter()
+        .filter(|t| matches!(t, TypeDetail::Enumeration(_)))
+        .count();
+    assert!(enums > 20, "expected many enums, got {enums}");
+
+    // A standard VCL enum, recovered with its value names purely by pointer-
+    // following — TScrollStyle isn't a published property type of most forms.
+    assert_eq!(
+        enum_values(&bin, "TScrollStyle").as_deref(),
+        Some(
+            ["ssNone", "ssHorizontal", "ssVertical", "ssBoth"]
+                .map(String::from)
+                .as_slice()
+        )
+    );
+}
+
+#[test]
+fn heidisql_type_closure_surfaces_standalone_rtti() {
+    let Some(data) = load("heidisql/portable_x64/heidisql.exe") else {
+        eprintln!("skipping: sample missing");
+        return;
+    };
+    let bin = DelphiBinary::parse(&data).expect("delphi 12");
+    let types = bin.types();
+    assert!(types.len() > 2000, "got {}", types.len());
+
+    // The point: the closure surfaces a large body of *non-class* standalone
+    // RTTI — enums, sets, records, method types — that no per-class accessor
+    // returns on its own.
+    let non_class = types
+        .iter()
+        .filter(|t| !matches!(t, TypeDetail::Class(_)))
+        .count();
+    assert!(
+        non_class > 400,
+        "expected >400 standalone non-class types, got {non_class}"
+    );
+    let enums = types
+        .iter()
+        .filter(|t| matches!(t, TypeDetail::Enumeration(_)))
+        .count();
+    assert!(enums > 100, "expected >100 enums, got {enums}");
+
+    // The structural ref-followers (method-signature, extended-property,
+    // tkPointer and tkArray references) pull in kinds the one-hop walk never
+    // reached.
+    assert!(
+        types.iter().any(|t| matches!(t, TypeDetail::Pointer(_))),
+        "closure should reach tkPointer records via the pointer follower"
+    );
+    assert!(
+        types.iter().any(|t| matches!(t, TypeDetail::Record(_))),
+        "closure should reach tkRecord records"
+    );
+
+    // The self-cell pass surfaces types referenced only from code
+    // (`TypeInfo(X)`), which the class-graph closure never reaches — e.g.
+    // System.SysUtils' TSearchRec record.
+    assert!(
+        types.iter().any(|t| matches!(
+            t,
+            TypeDetail::Record(r) if r.header.name() == "TSearchRec"
+        )),
+        "self-cell pass should surface the code-only TSearchRec record"
+    );
+
+    // Full record field tables (Delphi 2010+): TPoint = record X, Y: Integer.
+    let tpoint = types
+        .iter()
+        .find_map(|t| match t {
+            TypeDetail::Record(r) if r.header.name() == "TPoint" && !r.fields.is_empty() => Some(r),
+            _ => None,
+        })
+        .expect("TPoint record with decoded fields");
+    let field_names: Vec<&str> = tpoint.fields.iter().map(|f| f.name()).collect();
+    assert_eq!(field_names, ["X", "Y"], "TPoint fields");
+    assert!(
+        tpoint
+            .fields
+            .iter()
+            .all(|f| f.field_type.map(|h| h.name()) == Some("Integer")),
+        "TPoint field types should resolve to Integer"
+    );
+}
+
+#[test]
+fn delphi7_records_have_no_extended_fields() {
+    // Pre-2010 Delphi emits no extended record field table; the strict
+    // validation in the record decoder must not manufacture fields.
+    let Some(data) = load("lightalloy/LA.exe") else {
+        eprintln!("skipping: sample missing");
+        return;
+    };
+    let bin = DelphiBinary::parse(&data).expect("delphi 7");
+    let with_fields = bin
+        .types()
+        .iter()
+        .filter(|t| matches!(t, TypeDetail::Record(r) if !r.fields.is_empty()))
+        .count();
+    assert_eq!(
+        with_fields, 0,
+        "Delphi 7 should expose no extended record fields"
+    );
+}
+
+#[test]
+fn method_param_type_refs_resolve() {
+    // tkMethod records carry per-parameter PPTypeInfo references (Delphi 7+).
+    // TNotifyEvent = procedure(Sender: TObject) of object — the ref must
+    // point at the same type the legacy name-based parameter names.
+    let Some(data) = load("lightalloy/LA.exe") else {
+        eprintln!("skipping: sample missing");
+        return;
+    };
+    let bin = DelphiBinary::parse(&data).expect("delphi 7");
+    let notify = bin
+        .types()
+        .into_iter()
+        .find_map(|t| match t {
+            TypeDetail::Method(m) if m.header.name() == "TNotifyEvent" => Some(m),
+            _ => None,
+        })
+        .expect("TNotifyEvent method type");
+    assert_eq!(notify.params.len(), 1);
+    assert_eq!(notify.params[0].name(), "Sender");
+    assert_eq!(notify.params[0].type_name(), "TObject");
+    assert_eq!(notify.param_type_refs.len(), 1);
+    assert_ne!(
+        notify.param_type_refs[0], 0,
+        "param ref should be populated"
+    );
+}
+
+#[test]
+fn procedure_signatures_decode() {
+    // tkProcedure records carry an inline TProcedureSignature (Delphi 2010+).
+    // HeidiSQL embeds Win32 SSPI callback procedure types.
+    let Some(data) = load("heidisql/portable_x64/heidisql.exe") else {
+        eprintln!("skipping: sample missing");
+        return;
+    };
+    let bin = DelphiBinary::parse(&data).expect("delphi 12");
+    let with_sig = bin
+        .types()
+        .iter()
+        .filter(|t| matches!(t, TypeDetail::Procedure(p) if p.call_conv != 0xFF))
+        .count();
+    assert!(
+        with_sig > 0,
+        "expected at least one decoded procedure signature"
+    );
+}
+
+#[test]
+fn fpc_type_closure_works() {
+    // The closure is flavor-agnostic — it works on FPC binaries too.
+    let Some(data) = load("doublecmd/win32/doublecmd/doublecmd.exe") else {
+        eprintln!("skipping: sample missing");
+        return;
+    };
+    let bin = DelphiBinary::parse(&data).expect("fpc");
+    let types = bin.types();
+    assert!(types.len() > 1000, "got {}", types.len());
+    assert_eq!(
+        enum_values(&bin, "TAlignment").as_deref(),
+        Some(
+            ["taLeftJustify", "taRightJustify", "taCenter"]
+                .map(String::from)
+                .as_slice()
+        )
+    );
 }
 
 #[test]

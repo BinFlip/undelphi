@@ -167,12 +167,6 @@ keeps private).
 | Free Pascal / Lazarus | FPC 1.0 → FPC 3.2+ (incl. trunk-shaped 3.3) | PE32 / PE32+, Mach-O, ELF |
 | Arch | x86, x86_64, ARM, AArch64 | (per the build-string and / or container header) |
 
-Verified against an in-tree corpus of 11 real-world binaries spanning
-HeidiSQL (Delphi 12 Win64, Delphi XE5 Win32, FPC Lazarus aarch64-Darwin),
-Cheat Engine (FPC Win64), Double Commander (FPC Win32), DelphiLint
-(Delphi 12 BPL), Light Alloy (Delphi 7 Win32), and IDR (Delphi
-unspecified Win64). See [`SAMPLES.md`](SAMPLES.md) for the full corpus
-catalog including provenance and download commands.
 
 ## Performance
 
@@ -191,6 +185,4 @@ contemporary laptop.
   cargo run --release --example dump -- path/to/binary.exe
   ```
 
-Licensed under the [Apache License, Version 2.0](LICENSE). Sample
-binaries under `tests/samples/` retain their respective upstream
-licenses; see [`SAMPLES.md`](SAMPLES.md) for per-sample provenance.
+Licensed under the [Apache License, Version 2.0](LICENSE).

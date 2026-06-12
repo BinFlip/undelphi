@@ -141,6 +141,13 @@ pub const MAX_ENUM_RANGE: i64 = 512;
 /// 13 (`TFormatSettings` in heidisql_xe5_unpacked). 256 ≈ 20× headroom.
 pub const MAX_RECORD_MANAGED_FIELDS: usize = 256;
 
+/// Maximum entries in a `tkRecord` full (extended) field table — every
+/// field, not just managed ones (Delphi 2010+). Larger than the managed cap
+/// because records can declare many plain-value fields; 1024 bounds a
+/// misparse of the version-sensitive extended layout while covering any real
+/// record.
+pub const MAX_RECORD_FIELDS: usize = 1024;
+
 // ---------------------------------------------------------------------------
 // FPC resources
 // ---------------------------------------------------------------------------
@@ -150,3 +157,32 @@ pub const MAX_RECORD_MANAGED_FIELDS: usize = 256;
 /// sibling counts), so we keep the historical 32 768 — generous enough
 /// that legitimate trees never approach it.
 pub const MAX_FPC_RESOURCE_SIBLINGS: usize = 32_768;
+
+// ---------------------------------------------------------------------------
+// Forms
+// ---------------------------------------------------------------------------
+
+/// Maximum number of forms surfaced by the last-resort raw `TPF0`/`TPF1`
+/// magic-byte scan in [`crate::DelphiBinary::forms`].
+///
+/// The structured PE-RCDATA and FPC-resource passes are bounded by the
+/// resource directory itself and need no cap. The raw scan, by contrast,
+/// runs over the entire input buffer where coincidental magic matches are
+/// possible, so it is bounded to stop a pathological input from producing
+/// an unbounded form list. Empirical max across the corpus is 159
+/// (`cheatengine-x86_64.exe`); 4096 leaves generous headroom.
+pub const MAX_FORMS_RAW_SCAN: usize = 4096;
+
+// ---------------------------------------------------------------------------
+// RTTI type closure
+// ---------------------------------------------------------------------------
+
+/// Maximum distinct `PTypeInfo` records the transitive-closure type walk in
+/// [`crate::DelphiBinary::types`] will visit.
+///
+/// The walk follows `PPTypeInfo` pointers from the class graph, so it is
+/// bounded by the real RTTI graph (no raw scanning) — but a malformed binary
+/// could form a pathological reference chain through unrelated data. Empirical
+/// max in the corpus is ~3 000 distinct types (HeidiSQL 12 x64); 65 536 leaves
+/// a >20× margin while still capping a runaway walk.
+pub const MAX_RTTI_TYPES: usize = 65_536;

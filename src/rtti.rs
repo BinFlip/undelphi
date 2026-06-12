@@ -43,11 +43,15 @@
 use std::str;
 
 use crate::{
-    detection::TargetArch,
     formats::BinaryContext,
     interfaces::Guid,
-    limits::{MAX_ENUM_RANGE, MAX_IDENTIFIER_BYTES, MAX_METHOD_PARAMS, MAX_RECORD_MANAGED_FIELDS},
-    util::{deref_va, read_ptr, read_short_string_at_file, read_short_string_at_va, read_u16},
+    limits::{
+        MAX_ENUM_RANGE, MAX_IDENTIFIER_BYTES, MAX_METHOD_PARAMS, MAX_RECORD_FIELDS,
+        MAX_RECORD_MANAGED_FIELDS,
+    },
+    util::{
+        deref_va, read_ptr, read_short_string_at_file, read_short_string_at_va, read_u16, read_u32,
+    },
     vmt::{Vmt, VmtFlavor},
 };
 
@@ -315,11 +319,13 @@ impl<'a> TkClassInfo<'a> {
         let class_name = read_short_string_at_file(data, class_name_off)?;
         let mut type_data_off = file_off.checked_add(2)?.checked_add(class_name.len())?;
 
-        // On Mach-O / ELF targets with `FPC_REQUIRES_PROPER_ALIGNMENT`
-        // the first TypeData field is pointer-aligned after the preceding
-        // `Name: ShortString`. Windows PE packs.
+        // On `FPC_REQUIRES_PROPER_ALIGNMENT` targets (ARM / AArch64) the
+        // first TypeData field is pointer-aligned after the preceding
+        // `Name: ShortString`. x86 / x86-64 stay packed on *every* container
+        // — including ELF and Mach-O — so the decision is made from the
+        // architecture, not from "is this PE?".
         // Source: `reference/fpc-source/rtl/objpas/typinfo.pp:867-871`.
-        if ptr_size > 1 && !ctx.format().is_pe() {
+        if ptr_size > 1 && ctx.target_arch().fpc_requires_proper_alignment() {
             let rem = type_data_off.checked_rem(ptr_size)?;
             if rem != 0 {
                 let pad = ptr_size.checked_sub(rem)?;
@@ -740,6 +746,35 @@ pub struct RecordManagedField<'a> {
     pub field_type: Option<TypeHeader<'a>>,
 }
 
+/// One entry in a `tkRecord`'s full (extended) field table — *every* field,
+/// not just the managed ones. Emitted by Delphi 2010+.
+#[derive(Debug, Clone, Copy)]
+pub struct RecordField<'a> {
+    /// Field-type `PPTypeInfo` VA.
+    pub type_ref: u64,
+    /// Resolved field-type header, if the indirection succeeded.
+    pub field_type: Option<TypeHeader<'a>>,
+    /// Byte offset within the record.
+    pub offset: u32,
+    /// Visibility / flags byte.
+    pub flags: u8,
+    /// Field name (short-string body; may be empty for anonymous fields).
+    pub(crate) name: &'a [u8],
+}
+
+impl<'a> RecordField<'a> {
+    /// Field name as `&str`, lossily decoded.
+    #[inline]
+    pub fn name(&self) -> &'a str {
+        str::from_utf8(self.name).unwrap_or("<non-ascii>")
+    }
+    /// Raw field-name bytes.
+    #[inline]
+    pub fn name_bytes(&self) -> &'a [u8] {
+        self.name
+    }
+}
+
 /// `tkRecord` — value-type record definition.
 #[derive(Debug, Clone)]
 pub struct RecordInfo<'a> {
@@ -751,14 +786,105 @@ pub struct RecordInfo<'a> {
     /// strings, dynamic arrays, interfaces, other records with managed
     /// members).
     pub managed_fields: Vec<RecordManagedField<'a>>,
+    /// Full field table — every field with its name, type, offset, and
+    /// visibility. Populated only for Delphi 2010+ records that emit the
+    /// extended layout; empty otherwise (pre-2010 Delphi, FPC, or the
+    /// synthetic `vmtInitTable` record).
+    pub fields: Vec<RecordField<'a>>,
+}
+
+/// `tkPointer` — `^T` typed pointer.
+#[derive(Debug, Clone, Copy)]
+pub struct PointerInfo<'a> {
+    /// Header.
+    pub header: TypeHeader<'a>,
+    /// `PPTypeInfo` VA of the pointed-to type (`0` for untyped `Pointer`).
+    pub ref_type_ref: u64,
+    /// Resolved pointed-to type header, if the indirection succeeded.
+    pub ref_type: Option<TypeHeader<'a>>,
+}
+
+impl<'a> PointerInfo<'a> {
+    /// Decode a `tkPointer` record. The `TypeData` is a single `PPTypeInfo`
+    /// at offset 0 (`reference/pythia/pythia/core/structures.py:146-149`).
+    pub fn from_va(ctx: &BinaryContext<'a>, type_info_va: u64, flavor: VmtFlavor) -> Option<Self> {
+        let header = TypeHeader::from_va(ctx, type_info_va, flavor)?;
+        if header.kind != TypeKind::Pointer {
+            return None;
+        }
+        let data = ctx.data();
+        let ptr_size = ctx.pointer_size()?;
+        let off = ctx
+            .va_to_file(type_info_va)?
+            .checked_add(2)?
+            .checked_add(header.name.len())?;
+        let ref_type_ref = read_ptr(data, off, ptr_size)?;
+        let ref_type = TypeHeader::from_pptr(ctx, ref_type_ref, ptr_size, flavor);
+        Some(Self {
+            header,
+            ref_type_ref,
+            ref_type,
+        })
+    }
+}
+
+/// `tkArray` — fixed-length `array[...] of T`.
+#[derive(Debug, Clone, Copy)]
+pub struct ArrayInfo<'a> {
+    /// Header.
+    pub header: TypeHeader<'a>,
+    /// Total array size in bytes.
+    pub array_size: u32,
+    /// Element count.
+    pub element_count: u32,
+    /// `PPTypeInfo` VA of the element type.
+    pub element_type_ref: u64,
+    /// Resolved element type header, if the indirection succeeded.
+    pub element_type: Option<TypeHeader<'a>>,
+}
+
+impl<'a> ArrayInfo<'a> {
+    /// Decode a `tkArray` record. `TypeData` is `Size: u32`, `ElCount: u32`,
+    /// `ElType: PPTypeInfo` (`reference/pythia/pythia/core/structures.py:165-172`,
+    /// matching Delphi's `TArrayTypeData`). The trailing dimension table is
+    /// not decoded here.
+    pub fn from_va(ctx: &BinaryContext<'a>, type_info_va: u64, flavor: VmtFlavor) -> Option<Self> {
+        let header = TypeHeader::from_va(ctx, type_info_va, flavor)?;
+        if header.kind != TypeKind::Array {
+            return None;
+        }
+        let data = ctx.data();
+        let ptr_size = ctx.pointer_size()?;
+        let base = ctx
+            .va_to_file(type_info_va)?
+            .checked_add(2)?
+            .checked_add(header.name.len())?;
+        let array_size = read_u32(data, base)?;
+        let element_count = read_u32(data, base.checked_add(4)?)?;
+        let element_type_ref = read_ptr(data, base.checked_add(8)?, ptr_size)?;
+        let element_type = TypeHeader::from_pptr(ctx, element_type_ref, ptr_size, flavor);
+        Some(Self {
+            header,
+            array_size,
+            element_count,
+            element_type_ref,
+            element_type,
+        })
+    }
 }
 
 /// Sum type that wraps whichever per-Kind decoder matched.
 ///
 /// `decode_type_detail` returns this, so callers can match on Kind without
-/// pre-dispatching.
+/// pre-dispatching. `#[non_exhaustive]`: new per-Kind variants may be added
+/// in future releases, so external matches need a wildcard arm.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum TypeDetail<'a> {
+    /// tkPointer — `^T` typed pointer.
+    Pointer(PointerInfo<'a>),
+    /// tkArray — fixed-length array.
+    Array(ArrayInfo<'a>),
     /// tkClass — full class record including unit + published-property count.
     Class(TkClassInfo<'a>),
     /// tkEnumeration — element names + bounds.
@@ -803,6 +929,8 @@ impl<'a> TypeDetail<'a> {
             TypeDetail::Set(x) => x.header,
             TypeDetail::ClassRef(x) => x.header,
             TypeDetail::DynArray(x) => x.header,
+            TypeDetail::Pointer(x) => x.header,
+            TypeDetail::Array(x) => x.header,
             TypeDetail::Interface(x) => x.header,
             TypeDetail::Record(x) => x.header,
             TypeDetail::Method(x) => x.header,
@@ -833,6 +961,8 @@ impl<'a> TypeDetail<'a> {
             TypeKind::Set => Self::Set(SetInfo::from_va(ctx, type_info_va, flavor)?),
             TypeKind::ClassRef => Self::ClassRef(ClassRefInfo::from_va(ctx, type_info_va, flavor)?),
             TypeKind::DynArray => Self::DynArray(DynArrayInfo::from_va(ctx, type_info_va, flavor)?),
+            TypeKind::Pointer => Self::Pointer(PointerInfo::from_va(ctx, type_info_va, flavor)?),
+            TypeKind::Array => Self::Array(ArrayInfo::from_va(ctx, type_info_va, flavor)?),
             TypeKind::Interface => {
                 Self::Interface(InterfaceTypeInfo::from_va(ctx, type_info_va, flavor)?)
             }
@@ -847,6 +977,47 @@ impl<'a> TypeDetail<'a> {
             _ => Self::Other(header),
         };
         Some(detail)
+    }
+
+    /// The `PPTypeInfo` references this record points at — parent types,
+    /// enumeration base types, set/array element types, record managed-field
+    /// types, etc. Each value is a `PPTypeInfo` VA (dereference once to reach
+    /// the target `PTypeInfo`). Drives the transitive-closure type walk in
+    /// [`crate::DelphiBinary::types`]; `0` entries are filtered by the
+    /// caller. Property/field type references are *not* included here (they
+    /// live in the separate `TPropData` / field-table structures, seeded by
+    /// the caller).
+    pub fn referenced_pptrs(&self) -> Vec<u64> {
+        match self {
+            TypeDetail::Class(x) => vec![x.parent_info_va],
+            TypeDetail::Enumeration(x) => vec![x.base_type_ref],
+            TypeDetail::Set(x) => vec![x.comp_type_ref],
+            TypeDetail::ClassRef(x) => vec![x.instance_type_ref],
+            TypeDetail::DynArray(x) => vec![x.elem_type_ref_any, x.elem_type_ref_managed],
+            TypeDetail::Pointer(x) => vec![x.ref_type_ref],
+            TypeDetail::Array(x) => vec![x.element_type_ref],
+            TypeDetail::Interface(x) => vec![x.parent_ref],
+            TypeDetail::Record(x) => x
+                .managed_fields
+                .iter()
+                .map(|m| m.type_ref)
+                .chain(x.fields.iter().map(|f| f.type_ref))
+                .collect(),
+            TypeDetail::Procedure(x) => {
+                let mut refs: Vec<u64> = x.params.iter().map(|p| p.type_ref).collect();
+                refs.push(x.result_type_ref);
+                refs
+            }
+            TypeDetail::Method(x) => {
+                let mut refs = x.param_type_refs.clone();
+                refs.push(x.result_type_ref);
+                refs
+            }
+            TypeDetail::Ordinal(_)
+            | TypeDetail::Float(_)
+            | TypeDetail::String(_)
+            | TypeDetail::Other(_) => Vec::new(),
+        }
     }
 }
 
@@ -1129,13 +1300,55 @@ pub struct MethodInfo<'a> {
     pub params: Vec<MethodParam<'a>>,
     /// Return-type name when [`MethodKind::Function`] / related; empty otherwise.
     pub result_type: Option<&'a [u8]>,
+    /// Modern-RTTI (Delphi 2010+) per-parameter `PPTypeInfo` references, in
+    /// declaration order. Empty on legacy binaries that carry only the
+    /// name-based parameter list.
+    pub param_type_refs: Vec<u64>,
+    /// Modern-RTTI return-type `PPTypeInfo` reference (`0` when absent).
+    pub result_type_ref: u64,
 }
 
-/// `tkProcedure` — first-class reference-to-procedure type.
+/// One parameter of a `tkProcedure` signature (`TProcedureParam`).
+#[derive(Debug, Clone, Copy)]
+pub struct SignatureParam<'a> {
+    /// `TParamFlags` byte (var / const / out / …).
+    pub flags: u8,
+    /// Parameter-type `PPTypeInfo` VA.
+    pub type_ref: u64,
+    /// Resolved parameter-type header, if the indirection succeeded.
+    pub param_type: Option<TypeHeader<'a>>,
+    /// Parameter name (short-string body; may be empty).
+    pub(crate) name: &'a [u8],
+}
+
+impl<'a> SignatureParam<'a> {
+    /// Parameter name as `&str`, lossily decoded.
+    #[inline]
+    pub fn name(&self) -> &'a str {
+        str::from_utf8(self.name).unwrap_or("<non-ascii>")
+    }
+    /// Raw parameter-name bytes.
+    #[inline]
+    pub fn name_bytes(&self) -> &'a [u8] {
+        self.name
+    }
+}
+
+/// `tkProcedure` — first-class reference-to-procedure type. Decodes the
+/// inline `TProcedureSignature` (Delphi 2010+ / FPC); on older binaries that
+/// emit only the header the signature fields are empty.
 #[derive(Debug, Clone)]
 pub struct ProcedureInfo<'a> {
     /// Type header.
     pub header: TypeHeader<'a>,
+    /// Calling-convention byte (`TCallConv`); `0xFF` when no signature.
+    pub call_conv: u8,
+    /// Ordered parameters.
+    pub params: Vec<SignatureParam<'a>>,
+    /// Result-type `PPTypeInfo` VA (`0` for procedures / void).
+    pub result_type_ref: u64,
+    /// Resolved result-type header, if present and resolvable.
+    pub result_type: Option<TypeHeader<'a>>,
 }
 
 /// `tkLString` / `tkUString` / `tkWString` — string RTTI record.
@@ -1170,10 +1383,19 @@ impl<'a> MethodInfo<'a> {
         if num_params > MAX_METHOD_PARAMS {
             return None;
         }
+        // Per-parameter `Flags` is `set of TParamFlag`. FPC's `TParamFlag`
+        // has 12 elements → a 2-byte set; Delphi's has 7 → a 1-byte set.
+        // Reading the wrong width shifts every subsequent field and yields
+        // garbage names, so the width is flavor-dependent.
+        // Source: `reference/fpc-source/rtl/objpas/typinfo.pp:94-96, 981-997`.
+        let flag_width = match flavor {
+            VmtFlavor::Fpc => 2usize,
+            VmtFlavor::Delphi => 1,
+        };
         let mut params = Vec::with_capacity(num_params);
         for _ in 0..num_params {
             let flags = *data.get(cursor)?;
-            cursor = cursor.checked_add(1)?;
+            cursor = cursor.checked_add(flag_width)?;
             let name = read_short_string_at_file(data, cursor)?;
             cursor = cursor.checked_add(1)?.checked_add(name.len())?;
             let type_name = read_short_string_at_file(data, cursor)?;
@@ -1184,33 +1406,226 @@ impl<'a> MethodInfo<'a> {
                 type_name,
             });
         }
-        let result_type = if matches!(
+        let is_function = matches!(
             kind,
             MethodKind::Function | MethodKind::ClassFunction | MethodKind::SafeFunction
-        ) {
-            read_short_string_at_file(data, cursor)
+        );
+        let result_type = if is_function {
+            let rt = read_short_string_at_file(data, cursor)?;
+            cursor = cursor.checked_add(1)?.checked_add(rt.len())?;
+            Some(rt)
         } else {
             None
         };
+
+        // Modern-RTTI trailer (Delphi 2010+): `[ResultTypeRef: ptr (if
+        // function)]`, `CC: u8`, `ParamTypeRefs[num_params]: ptr`,
+        // `MethSig: ptr`. Source: `reference/IDR64/IDCGen.cpp::OutputRTTIMethod`.
+        // Strictly validated so legacy binaries (which stop after the
+        // name-based params) don't yield garbage references.
+        let ptr_size = ctx.pointer_size().unwrap_or(0);
+        let (param_type_refs, result_type_ref) = parse_method_modern_refs(
+            ctx,
+            cursor,
+            &params,
+            result_type,
+            is_function,
+            ptr_size,
+            flavor,
+        )
+        .unwrap_or_default();
+
         Some(Self {
             header,
             kind,
             params,
             result_type,
+            param_type_refs,
+            result_type_ref,
         })
     }
 }
 
+/// Parse the modern `tkMethod` reference trailer at `cursor` (after the
+/// name-based parameter list and result-type string). Returns
+/// `(param_type_refs, result_type_ref)` or `None` if the layout isn't
+/// present / doesn't validate.
+fn parse_method_modern_refs<'a>(
+    ctx: &BinaryContext<'a>,
+    cursor: usize,
+    params: &[MethodParam<'a>],
+    result_type: Option<&'a [u8]>,
+    is_function: bool,
+    ptr_size: usize,
+    flavor: VmtFlavor,
+) -> Option<(Vec<u64>, u64)> {
+    if ptr_size == 0 {
+        return None;
+    }
+    // The trailer carries no information when there are no parameters and no
+    // result type, and there's nothing to cross-check it against — so skip it
+    // rather than risk misreading legacy bytes.
+    if params.is_empty() && !is_function {
+        return None;
+    }
+    // Cross-check: each modern `PPTypeInfo` ref must resolve to a type whose
+    // name equals the already-decoded name-based type. This conclusively
+    // distinguishes the real Delphi-2010+ trailer from legacy bytes that
+    // merely *look* like one. A non-empty name that matches is "confirmed";
+    // an empty name can't be checked. We require at least one confirmation so
+    // the trailer is never accepted on unverifiable (empty-name) refs alone.
+    let mut confirmed = 0usize;
+    let mut check = |r: u64, expected: &[u8]| -> bool {
+        if expected.is_empty() {
+            return true; // unverifiable — must be carried by another match
+        }
+        if TypeHeader::from_pptr(ctx, r, ptr_size, flavor)
+            .map(|h| h.name_bytes() == expected)
+            .unwrap_or(false)
+        {
+            confirmed = confirmed.saturating_add(1);
+            true
+        } else {
+            false
+        }
+    };
+
+    let data = ctx.data();
+    let mut off = cursor;
+    let result_type_ref = if is_function {
+        let r = read_ptr(data, off, ptr_size)?;
+        off = off.checked_add(ptr_size)?;
+        if !check(r, result_type.unwrap_or(b"")) {
+            return None;
+        }
+        r
+    } else {
+        0
+    };
+    let cc = *data.get(off)?;
+    if cc > 11 {
+        return None;
+    }
+    off = off.checked_add(1)?;
+    let mut refs = Vec::with_capacity(params.len());
+    for p in params {
+        let r = read_ptr(data, off, ptr_size)?;
+        off = off.checked_add(ptr_size)?;
+        if !check(r, p.type_name) {
+            return None;
+        }
+        refs.push(r);
+    }
+    if confirmed == 0 {
+        return None; // nothing could be verified — don't trust it
+    }
+    Some((refs, result_type_ref))
+}
+
 impl<'a> ProcedureInfo<'a> {
-    /// Decode a `tkProcedure` record. Modern-RTTI-only — older
-    /// binaries emit just the header with no parameter info.
+    /// Decode a `tkProcedure` record, including its inline
+    /// `TProcedureSignature` (`Flags: u8`, `CC: u8`, `ResultTypeRef: ptr`,
+    /// `ParamCount: u8`, then `{ParamFlags: u8, ParamTypeRef: ptr, Name:
+    /// ShortString}` per parameter).
+    ///
+    /// Source: `reference/fpc-source/rtl/objpas/typinfo.pp:357-372`
+    /// (`TProcedureSignature` / `TProcedureParam`). The signature is strictly
+    /// validated — a `0xFF` flags byte, an implausible parameter count, or a
+    /// parameter type pointer that doesn't resolve yields a header-only
+    /// result rather than garbage (older binaries emit no signature).
     pub fn from_va(ctx: &BinaryContext<'a>, type_info_va: u64, flavor: VmtFlavor) -> Option<Self> {
         let header = TypeHeader::from_va(ctx, type_info_va, flavor)?;
         if header.kind != TypeKind::Procedure {
             return None;
         }
-        Some(Self { header })
+        let bare = Self {
+            header,
+            call_conv: 0xFF,
+            params: Vec::new(),
+            result_type_ref: 0,
+            result_type: None,
+        };
+        let Some(ptr_size) = ctx.pointer_size() else {
+            return Some(bare);
+        };
+        let Some(td) = ctx
+            .va_to_file(type_info_va)
+            .and_then(|o| o.checked_add(2))
+            .and_then(|o| o.checked_add(header.name.len()))
+        else {
+            return Some(bare);
+        };
+        // Delphi's `tkProcedure` TypeData is a pointer to the
+        // `TProcedureSignature` (FPC embeds it inline; we read the Delphi
+        // pointer form). Source: `reference/pythia/.../structures.py:174-177`.
+        let sig = ctx.data().get(td..).and_then(|_| {
+            let sig_va = read_ptr(ctx.data(), td, ptr_size)?;
+            let sig_off = ctx.va_to_file(sig_va)?;
+            decode_procedure_signature(ctx, sig_off, ptr_size, flavor, header)
+        });
+        Some(sig.unwrap_or(bare))
     }
+}
+
+/// Decode an inline `TProcedureSignature` at `td` (file offset), returning a
+/// fully-populated [`ProcedureInfo`] or `None` if it fails validation.
+fn decode_procedure_signature<'a>(
+    ctx: &BinaryContext<'a>,
+    td: usize,
+    ptr_size: usize,
+    flavor: VmtFlavor,
+    header: TypeHeader<'a>,
+) -> Option<ProcedureInfo<'a>> {
+    let data = ctx.data();
+    let flags = *data.get(td)?;
+    if flags == 0xFF {
+        return None; // explicit "no signature"
+    }
+    let call_conv = *data.get(td.checked_add(1)?)?;
+    if call_conv > 11 {
+        return None; // not a valid TCallConv → not this layout
+    }
+    let result_type_ref = read_ptr(data, td.checked_add(2)?, ptr_size)?;
+    if result_type_ref != 0
+        && TypeHeader::from_pptr(ctx, result_type_ref, ptr_size, flavor).is_none()
+    {
+        return None;
+    }
+    let result_type = TypeHeader::from_pptr(ctx, result_type_ref, ptr_size, flavor);
+    let count_off = td.checked_add(2)?.checked_add(ptr_size)?;
+    let param_count = *data.get(count_off)? as usize;
+    if param_count > MAX_METHOD_PARAMS {
+        return None;
+    }
+    let mut off = count_off.checked_add(1)?;
+    let mut params = Vec::with_capacity(param_count);
+    for _ in 0..param_count {
+        let pflags = *data.get(off)?;
+        let type_ref = read_ptr(data, off.checked_add(1)?, ptr_size)?;
+        let param_type = TypeHeader::from_pptr(ctx, type_ref, ptr_size, flavor);
+        if type_ref != 0 && param_type.is_none() {
+            return None; // garbage → not a real signature
+        }
+        let name_off = off.checked_add(1)?.checked_add(ptr_size)?;
+        let name = read_short_string_at_file(data, name_off)?;
+        if !name.is_empty() && !is_plausible_identifier(name) {
+            return None;
+        }
+        off = name_off.checked_add(1)?.checked_add(name.len())?;
+        params.push(SignatureParam {
+            flags: pflags,
+            type_ref,
+            param_type,
+            name,
+        });
+    }
+    Some(ProcedureInfo {
+        header,
+        call_conv,
+        params,
+        result_type_ref,
+        result_type,
+    })
 }
 
 impl<'a> StringInfo<'a> {
@@ -1298,12 +1713,85 @@ impl<'a> RecordInfo<'a> {
                 field_type,
             });
         }
+        // Full (extended) field table — Delphi 2010+ lists every field after
+        // the managed-field / operator section. Strictly validated so that
+        // pre-2010 Delphi, FPC, and the synthetic (empty-name) init-table
+        // record never produce garbage: any implausible field discards the
+        // whole list (returns empty rather than partial).
+        let fields = if flavor == VmtFlavor::Delphi && !name.is_empty() {
+            parse_record_fields(ctx, off, ptr_size, flavor).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         Some(Self {
             header,
             record_size,
             managed_fields,
+            fields,
         })
     }
+}
+
+/// Parse the Delphi 2010+ extended record field table that follows the
+/// managed-field section: `NumOps: u8`, `RecOps[NumOps]: ptr`,
+/// `RecFldCnt: u32`, then `RecFldCnt` × `{ TypeRef: ptr; FldOffset: u32;
+/// Flags: u8; Name: ShortString; AttrData: u16-length }`.
+///
+/// Source: `reference/DelphiHelper/.../DelphiClass_TypeInfo_tkRecord.py`
+/// (`__CreateRecordTypeField`). Returns `None` (→ empty) if anything looks
+/// implausible, since the host record may predate this layout.
+fn parse_record_fields<'a>(
+    ctx: &BinaryContext<'a>,
+    start_off: usize,
+    ptr_size: usize,
+    flavor: VmtFlavor,
+) -> Option<Vec<RecordField<'a>>> {
+    let data = ctx.data();
+    let num_ops = *data.get(start_off)? as usize;
+    if num_ops > 16 {
+        return None; // not the extended layout
+    }
+    let mut off = start_off
+        .checked_add(1)?
+        .checked_add(num_ops.checked_mul(ptr_size)?)?;
+    let count = read_u32(data, off)? as usize;
+    off = off.checked_add(4)?;
+    if count == 0 || count > MAX_RECORD_FIELDS {
+        return None;
+    }
+    let mut fields = Vec::with_capacity(count.min(MAX_RECORD_FIELDS));
+    for _ in 0..count {
+        let type_ref = read_ptr(data, off, ptr_size)?;
+        // `FldOffset` is pointer-sized (`MakeCustomWord(addr+wordSize,
+        // wordSize)` in DelphiHelper), not a fixed `u32` — so on 64-bit the
+        // flags / name follow at `2 * ptr_size`, not `ptr_size + 4`.
+        let offset = read_ptr(data, off.checked_add(ptr_size)?, ptr_size)? as u32;
+        let flags_off = off.checked_add(ptr_size)?.checked_add(ptr_size)?;
+        let flags = *data.get(flags_off)?;
+        let name_off = flags_off.checked_add(1)?;
+        let fname = read_short_string_at_file(data, name_off)?;
+        // Structural gate: a real field has a plausible (or empty) name and a
+        // type pointer that is either null or resolves to a valid record.
+        // Random bytes past a non-extended record fail this immediately.
+        if !fname.is_empty() && !is_plausible_identifier(fname) {
+            return None;
+        }
+        let field_type = TypeHeader::from_pptr(ctx, type_ref, ptr_size, flavor);
+        if type_ref != 0 && field_type.is_none() {
+            return None;
+        }
+        let attr_off = name_off.checked_add(1)?.checked_add(fname.len())?;
+        let attr_len = read_u16(data, attr_off)? as usize;
+        off = attr_off.checked_add(attr_len.max(2))?;
+        fields.push(RecordField {
+            type_ref,
+            field_type,
+            offset,
+            flags,
+            name: fname,
+        });
+    }
+    Some(fields)
 }
 
 /// Sweep the binary's read-only data for every FPC `tkInterface` record
@@ -1382,7 +1870,7 @@ impl<'a> IntfMethodTable<'a> {
         // FPC's `aligntoptr` is a no-op on architectures without
         // `FPC_REQUIRES_PROPER_ALIGNMENT` (i.e. x86 / x86_64 in any
         // container). It only inserts padding on ARM / AArch64 etc.
-        let needs_alignment = !matches!(ctx.target_arch(), TargetArch::X86 | TargetArch::X86_64);
+        let needs_alignment = ctx.target_arch().fpc_requires_proper_alignment();
 
         // Walk past kind(1), namelen(1), name, parent_ref(ptr),
         // flags(1), guid(16), unit_name(shortstring) → reach

@@ -1,6 +1,6 @@
 [package]
 name = "undelphi"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 authors = ["Johann Kempter <admin@binflip.rs>"]
 rust-version = "1.88"
@@ -33,7 +33,7 @@ default = []
 tracing = ["dep:tracing"]
 
 [dependencies]
-goblin = "0.10.5"
+goblin = "0.10.7"
 scroll = "0.13.0"
 tracing = { version = "0.1.44", optional = true }
 

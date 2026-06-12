@@ -533,6 +533,48 @@ impl<'a> DfmObject<'a> {
     }
 }
 
+/// Scan `data` for `TPF0` / `TPF1` magic and return every offset at which a
+/// complete form stream re-parses, paired with its parsed root object.
+///
+/// This is the engine behind [`crate::DelphiBinary::forms`]'s last-resort
+/// fallback for stripped / packed binaries whose form streams aren't
+/// reachable through the structured PE-resource or FPC-resource passes.
+/// Every four-byte magic hit is validated by [`DfmObject::parse`];
+/// coincidental matches that don't decode — or that decode without a class
+/// name — are discarded. At most `max` streams are returned, which bounds
+/// the work on a pathological input whose bytes are dense in magic
+/// sequences (see [`crate::limits::MAX_FORMS_RAW_SCAN`]).
+///
+/// The scan is byte-granular rather than pointer-aligned because a packer
+/// may relocate streams to arbitrary file offsets; `DfmObject::parse`
+/// self-bounds each candidate, so over-scanning is safe.
+pub(crate) fn scan_streams(data: &[u8], max: usize) -> Vec<(usize, DfmObject<'_>)> {
+    let mut out = Vec::new();
+    for i in 0..data.len() {
+        if out.len() >= max {
+            break;
+        }
+        let Some(window) = data.get(i..i.saturating_add(4)) else {
+            // Fewer than four bytes remain — no further magic possible.
+            break;
+        };
+        if window != TPF0_MAGIC && window != TPF1_MAGIC {
+            continue;
+        }
+        let Some(stream) = data.get(i..) else {
+            continue;
+        };
+        let Some(obj) = DfmObject::parse(stream) else {
+            continue;
+        };
+        if obj.class_name_bytes().is_empty() {
+            continue;
+        }
+        out.push((i, obj));
+    }
+    out
+}
+
 struct Cursor<'a> {
     buf: &'a [u8],
     pos: usize,
@@ -824,6 +866,65 @@ fn read_value<'a>(cur: &mut Cursor<'a>) -> Option<DfmValue<'a>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Smallest well-formed TPF0 stream: root `TForm1`/`Form1`, no
+    /// properties, no children. 19 bytes, self-terminating.
+    fn minimal_tpf0() -> Vec<u8> {
+        let mut s = Vec::new();
+        s.extend_from_slice(TPF0_MAGIC);
+        s.push(6);
+        s.extend_from_slice(b"TForm1");
+        s.push(5);
+        s.extend_from_slice(b"Form1");
+        s.push(0); // empty property name terminates the property list
+        s.push(0); // empty child class name terminates the child list
+        s
+    }
+
+    #[test]
+    fn minimal_stream_parses() {
+        let s = minimal_tpf0();
+        let obj = DfmObject::parse(&s).expect("minimal stream parses");
+        assert_eq!(obj.class_name(), "TForm1");
+        assert_eq!(obj.object_name(), "Form1");
+        assert!(obj.properties.is_empty());
+        assert!(obj.children.is_empty());
+    }
+
+    #[test]
+    fn scan_streams_finds_buried_stream() {
+        let stream = minimal_tpf0();
+        // Noise, then a bare-magic false positive that must NOT yield a
+        // form (empty class name → parse fails), then the real stream.
+        let mut data = vec![0xAAu8; 17];
+        data.extend_from_slice(b"TPF0\x00\x00"); // magic + zero-length class
+        data.extend_from_slice(&[0xBB; 5]);
+        let offset = data.len();
+        data.extend_from_slice(&stream);
+        data.extend_from_slice(&[0xCC; 9]);
+
+        let hits = scan_streams(&data, 4096);
+        assert_eq!(hits.len(), 1, "exactly one valid stream survives");
+        assert_eq!(hits[0].0, offset, "hit reported at the stream's offset");
+        assert_eq!(hits[0].1.class_name(), "TForm1");
+    }
+
+    #[test]
+    fn scan_streams_respects_cap() {
+        let stream = minimal_tpf0();
+        let mut data = Vec::new();
+        for _ in 0..5 {
+            data.extend_from_slice(&stream);
+        }
+        let hits = scan_streams(&data, 2);
+        assert_eq!(hits.len(), 2, "scan stops once the cap is reached");
+    }
+
+    #[test]
+    fn scan_streams_empty_on_garbage() {
+        assert!(scan_streams(&[0u8; 256], 4096).is_empty());
+        assert!(scan_streams(b"TPF0", 4096).is_empty()); // magic only, no body
+    }
 
     #[test]
     fn extended_to_f64_zero() {

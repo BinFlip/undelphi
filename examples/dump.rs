@@ -441,12 +441,26 @@ fn render_detail_inline(detail: &TypeDetail<'_>) -> String {
             x.flags,
             x.unit_name().unwrap_or("?")
         ),
-        TypeDetail::Record(x) => format!(
-            "{} size={} managed_fields={}",
-            base,
-            x.record_size,
-            x.managed_fields.len()
-        ),
+        TypeDetail::Record(x) => {
+            let fields: Vec<_> = x
+                .fields
+                .iter()
+                .map(|f| {
+                    format!(
+                        "{}:{}",
+                        f.name(),
+                        f.field_type.map(|h| h.name()).unwrap_or("?")
+                    )
+                })
+                .collect();
+            format!(
+                "{} size={} managed_fields={} fields=[{}]",
+                base,
+                x.record_size,
+                x.managed_fields.len(),
+                fields.join("; ")
+            )
+        }
         TypeDetail::Method(x) => {
             let params: Vec<_> = x
                 .params
@@ -459,9 +473,44 @@ fn render_detail_inline(detail: &TypeDetail<'_>) -> String {
                 .unwrap_or_default();
             format!("{} {:?}({}){}", base, x.kind, params.join(", "), ret)
         }
-        TypeDetail::Procedure(_) => base,
+        TypeDetail::Procedure(x) => {
+            let params: Vec<_> = x
+                .params
+                .iter()
+                .map(|p| {
+                    format!(
+                        "{}:{}",
+                        p.name(),
+                        p.param_type.map(|h| h.name()).unwrap_or("?")
+                    )
+                })
+                .collect();
+            let ret = x
+                .result_type
+                .map(|h| format!(" -> {}", h.name()))
+                .unwrap_or_default();
+            format!("{base} ({}){ret}", params.join(", "))
+        }
+        TypeDetail::Pointer(x) => {
+            let to = x
+                .ref_type
+                .map(|h| h.name().to_string())
+                .unwrap_or_else(|| "?".into());
+            format!("{base} ^{to}")
+        }
+        TypeDetail::Array(x) => {
+            let elem = x
+                .element_type
+                .map(|h| h.name().to_string())
+                .unwrap_or_else(|| "?".into());
+            format!(
+                "{base} [{}] of={} size={}",
+                x.element_count, elem, x.array_size
+            )
+        }
         TypeDetail::String(x) => format!("{} codepage={}", base, x.code_page),
         TypeDetail::Other(_) => base,
+        _ => base,
     }
 }
 

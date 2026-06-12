@@ -17,7 +17,8 @@ the SHA-256 check column for integrity.
 | 3 | FPC 3.2.2 / Lazarus | macOS | aarch64 | Mach-O | `tests/samples/heidisql/macos/heidisql.app/Contents/MacOS/heidisql` | scan TBD |
 | 4 | FPC 3.2.2 / Lazarus | Windows | x86 | PE32 GUI | `tests/samples/doublecmd/win32/doublecmd/doublecmd.exe` | 114 |
 | 5 | FPC 3.0.4 / Lazarus | Windows | x86_64 | PE32+ GUI | `tests/samples/cheatengine/bin/cheatengine-x86_64.exe` | 159 |
-| 6 | FPC 3.2.2 / Lazarus | macOS | x86_64 | DMG (unextracted) | `tests/samples/doublecmd/doublecmd-1.1.32.cocoa.x86_64.dmg` | — |
+| 6 | FPC 3.2.2 / Lazarus | macOS | x86_64 | Mach-O | `tests/samples/doublecmd/macos_x86_64/doublecmd.macho` | 117 |
+| 12 | FPC 3.2.2 / Lazarus | Linux | x86_64 | ELF | `tests/samples/doublecmd/linux_x86_64/doublecmd.elf` | 120 |
 | 7 | Delphi (32-bit) | Windows | x86 | PE32 DLL | `tests/samples/others/IDR-cpp-dis.dll` | 0 |
 | 8 | Delphi 7 | Windows | x86 | PE32 GUI | `tests/samples/lightalloy/LA.exe` | 33 (of 34 magic hits; 1 non-RCDATA coincidence) |
 | 9 | Delphi XE5, UPX-packed | Windows | x86 | PE32 GUI | `tests/samples/heidisql/portable_x86_xe5/heidisql.exe` | — (rejected, see notes) |
@@ -30,6 +31,8 @@ Compiler fingerprints were verified by `strings` grep:
 - `doublecmd.exe` — `FPC 3.2.2 [2021/05/15] for i386 - Win32`
 - `cheatengine-x86_64.exe` — `FPC 3.0.4 [2019/10/27] for x86_64 - Win64`
 - `heidisql (mac)` — `FPC 3.2.2 [2021/05/16] for aarch64 - Darwin`
+- `doublecmd.macho` (macOS x86_64) — `FPC 3.2.2 [2021/05/16] for x86_64 - Darwin`
+- `doublecmd.elf` (Linux x86_64) — `FPC 3.2.2 [2024/05/03] for x86_64 - Linux`
 - `DelphiLintClient-1.3.0-Athens.bpl` — `Embarcadero Delphi for Win32 compiler version 36.0 (29.0.52161.7750)`
 - `LA.exe` — no explicit compiler version string (pre-XE Delphi did not emit one); Borland Delphi RTL registry markers present (`SOFTWARE\Borland\Delphi\RTL`, `Delphi Component`, `Delphi Picture`), and the upstream README requires Borland Delphi 7 to build.
 - `heidisql.unpacked.exe` (9.5) — no explicit compiler version string, but namespaced unit names (`System.Masks`, `Vcl.ActnList`, `Vcl.ComCtrls`, …) confirm Delphi XE2+; maintainer forum post identifies the XE5 migration as the build target for this release.
@@ -84,7 +87,27 @@ curl -L -o tests/samples/doublecmd/doublecmd-1.1.32.cocoa.x86_64.dmg \
   "https://github.com/doublecmd/doublecmd/releases/download/v1.1.32/doublecmd-1.1.32.cocoa.x86_64.dmg"
 unzip -q tests/samples/doublecmd/doublecmd-1.1.32.i386-win32.zip \
   -d tests/samples/doublecmd/win32/
-# DMG is not extracted on non-macOS hosts; use `hdiutil attach` / 7z on mac.
+
+# Linux x86_64 ELF (sample #12) — extract the `doublecmd` binary from the gtk2 tarball:
+curl -L -o /tmp/dc-linux.tar.xz \
+  "https://github.com/doublecmd/doublecmd/releases/download/v1.1.32/doublecmd-1.1.32.gtk2.x86_64.tar.xz"
+mkdir -p tests/samples/doublecmd/linux_x86_64
+tar -xJf /tmp/dc-linux.tar.xz -C tests/samples/doublecmd/linux_x86_64 doublecmd/doublecmd
+mv tests/samples/doublecmd/linux_x86_64/doublecmd/doublecmd \
+   tests/samples/doublecmd/linux_x86_64/doublecmd.elf
+rmdir tests/samples/doublecmd/linux_x86_64/doublecmd
+
+# macOS x86_64 Mach-O (sample #6) — mount the DMG and copy the executable.
+# The DMG itself is not kept in-tree (re-downloadable); only the extracted
+# Mach-O binary is committed.
+curl -L -o /tmp/dc.dmg \
+  "https://github.com/doublecmd/doublecmd/releases/download/v1.1.32/doublecmd-1.1.32.cocoa.x86_64.dmg"
+MNT=$(hdiutil attach -nobrowse -readonly /tmp/dc.dmg | grep -oE '/Volumes/.*' | head -1)
+mkdir -p tests/samples/doublecmd/macos_x86_64
+cp "$MNT/Double Commander.app/Contents/MacOS/doublecmd" \
+   tests/samples/doublecmd/macos_x86_64/doublecmd.macho
+hdiutil detach "$MNT"
+# On a non-macOS host, substitute `7z x dc.dmg` to extract the HFS image.
 ```
 
 Source: [github.com/doublecmd/doublecmd](https://github.com/doublecmd/doublecmd),

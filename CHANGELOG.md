@@ -1,5 +1,84 @@
 # Changelog
 
+## 0.3.0
+
+Capability release. The headline is **`DelphiBinary::types()`**, a complete
+RTTI type dictionary, plus **method-signature decoding** and a wave of new
+per-Kind RTTI detail. Two real decoding bugs affecting FPC on x86-64 ELF /
+Mach-O and FPC event-type signatures are fixed. Container coverage gains its
+first Linux ELF and macOS x86-64 Mach-O test binaries.
+
+### Added
+
+- **`DelphiBinary::types()`** — enumerate every RTTI type record in the
+  binary, not just the ones hanging off a class. It runs a transitive
+  closure over `PPTypeInfo` references (class parents, property / field
+  types, method-signature param/return types, extended-property types, enum
+  base types, set/array/dynarray element types, pointer targets, record
+  fields, interface parents) and then, on Delphi, a **self-cell pass** (every
+  Delphi `PTypeInfo` is preceded by a self-referencing `PPTypeInfo` cell —
+  the `vmtSelfPtr` analogue) that recovers types referenced only from code.
+  Reaches ~97 % of all `PTypeInfo` in a Delphi image (e.g. the enum
+  dictionary on HeidiSQL 12 grows from ~250 to ~880). Returns
+  `Vec<TypeDetail>`; bounded by `limits::MAX_RTTI_TYPES`.
+- **Method signatures** — `DelphiBinary::method_signatures(class)` returns an
+  era-tagged `signatures::SignatureReport` (`Decoded` / `Absent` /
+  `Unsupported`) of `MethodSignature` (name, `MethodKind`, `CallConv`, ordered
+  `MethodParam`s with name / resolved type / `ParamMode`, return type, code
+  VA). Sources: the Delphi 2010+ extended-method section of the
+  `vmtMethodTable` (the primary source) and the published-method trailer
+  (`{$METHODINFO ON}`). New `signatures` module.
+- **New / richer RTTI decoders** (all reachable via `types()` and
+  `rtti::TypeDetail`):
+  - `tkPointer` and `tkArray` now decode (`TypeDetail::Pointer` / `Array`
+    with `PointerInfo` / `ArrayInfo` and their target / element types).
+  - `RecordInfo::fields` — the full Delphi 2010+ record field table (every
+    field's name, resolved type, offset, and visibility flags), not just
+    managed fields. New `rtti::RecordField`.
+  - `ProcedureInfo` now decodes its inline `TProcedureSignature` (calling
+    convention, parameters, return type) instead of just the header. New
+    `rtti::SignatureParam`.
+  - `MethodInfo::param_type_refs` / `result_type_ref` — the modern `tkMethod`
+    per-parameter `PPTypeInfo` references (cross-validated against the
+    name-based parameter types).
+  - `TypeDetail::referenced_pptrs()` — the onward type references a record
+    points at.
+- **`forms()` raw-magic fallback** — when the PE `RT_RCDATA` and FPC
+  internal-resources passes find nothing, `forms()` now scans for `TPF0` /
+  `TPF1` streams and re-parses each candidate, recovering forms from stripped
+  or unconventionally-packaged binaries. New `dfm::scan_streams`.
+- `detection::TargetArch::fpc_requires_proper_alignment()`.
+- `examples/corpus_scan` — a re-runnable bulk triage / regression tool that
+  reports parse outcomes, compiler / format histograms, and extraction
+  anomalies across a directory tree.
+- First Linux ELF (`doublecmd` gtk2 x86-64, FPC) and macOS x86-64 Mach-O
+  (`doublecmd` cocoa, FPC) test binaries, with integration tests.
+
+### Fixed
+
+- **FPC `TTypeData` alignment on x86-64 ELF / Mach-O.** The decoder gated
+  natural-alignment on "is this *not* PE?" rather than on the architecture,
+  so it inserted phantom padding on x86-64 ELF / Mach-O (which FPC packs).
+  Every unit name and field table on those targets decoded to garbage. Now
+  keyed on `TargetArch` (`FPC_REQUIRES_PROPER_ALIGNMENT` is an
+  ARM/AArch64/PPC/SPARC property). Recovers ~2 500 unit names and the field
+  tables on the new ELF / Mach-O x86-64 test binaries.
+- **FPC `tkMethod` parameter flags.** FPC's `TParamFlag` is a 12-element set
+  (2 bytes); Delphi's is 7 (1 byte). The decoder read 1 byte for both,
+  shifting every following field and garbling FPC event-type signatures
+  (`TNotifyEvent` etc.). Now flavor-dependent.
+
+### Breaking changes
+
+- **`rtti::TypeDetail` is now `#[non_exhaustive]`** and gains `Pointer` and
+  `Array` variants. Exhaustive matches must add a wildcard arm. Marking the
+  enum non-exhaustive means future per-Kind decoders won't be breaking.
+- **New public fields** on existing structs: `rtti::RecordInfo::fields`,
+  `rtti::MethodInfo::{param_type_refs, result_type_ref}`, and several fields
+  on `rtti::ProcedureInfo` (previously header-only). Struct patterns that
+  destructure these without `..` need updating; field reads and the parser
+  output are unaffected.
+
 ## 0.2.1
 
 Ergonomic release driven by downstream-consumer feedback. This version keeps
