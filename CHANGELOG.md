@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.3.1
+
+Maintenance release. Fixes the crates.io repository link and refreshes the
+dependency lockfile. No API or behavior changes.
+
+### Fixed
+
+- **crates.io `repository` link** pointed at `BinFlip/delphi` instead of
+  `BinFlip/undelphi`, so the "Repository" link redirected to the wrong project
+  ([#1](https://github.com/BinFlip/undelphi/issues/1)).
+
+### Dependencies
+
+- Refreshed `Cargo.lock` to the latest semver-compatible transitive versions
+  (`log` 0.4.29 → 0.4.33, `quote` 1.0.45 → 1.0.46, `syn` 2.0.117 → 2.0.118).
+  Direct dependencies (`goblin`, `scroll`, `tracing`) were already current.
+
 ## 0.3.0
 
 Capability release. The headline is **`DelphiBinary::types()`**, a complete
